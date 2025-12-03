@@ -1,0 +1,88 @@
+# Aquanotes Triangle (ESP32-S3)
+
+UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan OLED SSD1306 128x64. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), DO (S-RJY-01) dan suhu DS18B20, lalu menampilkan ke OLED serta mengirim telemetry ke server HTTP.
+
+## Build & Flash (PlatformIO)
+- Prasyarat: PlatformIO CLI atau VSCode + PlatformIO.
+- Board: `esp32-s3-devkitc-1`
+- Flash & monitor:
+  ```sh
+  pio run -t upload
+  pio device monitor -b 115200
+  ```
+
+## Navigasi UI (OLED + 4 Tombol)
+- OK dari dashboard: buka main menu. BACK: kembali ke dashboard.
+- Main menu:
+  - Dashboard: kembali ke layar utama.
+  - WiFi Manager: mulai portal WiFi (captive portal) untuk konfigurasi SSID/password.
+  - Kalibrasi Sensor: masuk submenu kalibrasi.
+  - Sensor Mode: hanya indikator mode (PH/EC/NH4) di UI.
+- Sensor Mode: pilih PH/EC/NH4, OK untuk set mode lalu kembali ke dashboard.
+- WiFi Manager: OK untuk menyalakan portal WiFi.
+- Kalibrasi:
+  - Cal EC (Auto): pilih 1413 uS/cm atau 12880 uS/cm, OK untuk kirim perintah kalibrasi (Modbus).
+  - Cal NH4: (placeholder, belum diimplementasi pada firmware ini).
+  - Cal DO: Temp from DS (kirim suhu DS18B20), Zero, Slope.
+  - Cal pH (S-PH-01): pH 4.01 / 7.00 / 10.01 atau pengaturan kompensasi suhu (External/Off/Onboard).
+  - BACK di submenu manapun: kembali ke dashboard.
+
+## Telemetry HTTP
+- Endpoint: `https://aeraseaku.inkubasistartupunhas.id/sensor/`
+- Payload: JSON berisi UID, suhu, pH, DO, TDS, NH4, salinitas, timestamp.
+- Interval: 10 s (konfigurasi `POST_INTERVAL_MS`).
+
+## Galeri
+- Tambahkan path gambar di sini (mis. `assets/foto-rakit.jpg`).
+
+## Diagram (Mermaid)
+
+### Flowchart Utama
+```mermaid
+flowchart TD
+  A[Boot ESP32-S3] --> B[Init I2C/OLED/Queues/Tasks]
+  B --> C[TaskInput]
+  B --> D[TaskUI]
+  B --> E[TaskSensors]
+  B --> F[TaskHTTP]
+  C --> D
+  E --> D
+  E --> F
+  D -->|WiFi Portal| F
+```
+
+### Block Diagram
+```mermaid
+graph LR
+  MCU[ESP32-S3] --- OLED[OLED SSD1306]
+  MCU --- Buttons[UP/DOWN/OK/BACK]
+  MCU --- DS18B20
+  MCU --- RS485
+  RS485 --- PH[pH S-PH-01]
+  RS485 --- EC[EC/TDS S-EC-01]
+  RS485 --- NH4[NH4 RS485]
+  RS485 --- DO[DO S-RJY-01]
+  MCU --- WiFi[WiFi STA / Portal]
+  MCU --> Server[HTTP Server]
+```
+
+### Sequence / Data Flow
+```mermaid
+sequenceDiagram
+  participant Btn as TaskInput
+  participant UI as TaskUI
+  participant S as TaskSensors
+  participant H as TaskHTTP
+  participant SV as Server
+
+  Btn->>UI: Queue InputEvent
+  S-->>UI: Queue DisplayData (overwrite)
+  S-->>H: Queue Telemetry (overwrite)
+  UI->>UI: Render OLED / Menus
+  UI->>H: Set flag portal (WiFi Manager)
+  H->>H: WiFi connect / NTP
+  H->>SV: HTTP POST telemetry (10s)
+  SV-->>H: HTTP 200/201 status
+  H-->>S: Update postStatus flag
+  S-->>UI: Update postStatus for display
+```
