@@ -42,7 +42,6 @@ static const uint32_t I2C_FREQ = 400000;
 #define RS485_DE_RE_PIN 14
 
 // Slave IDs (pH/EC/NH4 sekarang unik, DO tetap 55)
-#define RK_SLAVE_ID   0x06   // RK500-09 multi-parameter (default Modbus addr 06H)
 #define PH_SLAVE_ID   12   // pH
 #define EC_SLAVE_ID   30   // EC/TDS/Sal
 #define NH4_SLAVE_ID  1   // NH4
@@ -56,7 +55,7 @@ static const uint32_t I2C_FREQ = 400000;
 
 // Server & Identitas
 const char* POST_URL   = "https://aeraseaku.inkubasistartupunhas.id/sensor/";
-const char* UID        = "AER2023AQ0020";
+const char* UID        = "AER2023AQ0019";
 const char* FW_VERSION = "v1.3.0-RTOS-BTN4";
 const uint32_t POST_INTERVAL_MS = 10000; // 10 detik
 const uint32_t HTTP_TIMEOUT_MS  = 3500;
@@ -69,7 +68,6 @@ const char* NTP_SERVER_3 = "id.pool.ntp.org";   // fallback 2 (regional)
 
 const long  GMT_OFFSET   = 8 * 3600; // GMT+8
 const int   DAYLIGHT_OFF = 0;
-
 
 // =======================
 //  INPUT: 4 BUTTON
@@ -93,10 +91,6 @@ OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
 HardwareSerial RS485(2);
 
-// Multi-parameter sensor RK500-09
-ModbusMaster mb_rk;
-
-// (opsional) legacy objects untuk menu kalibrasi lama
 ModbusMaster mb_ph, mb_ec, mb_nh4, mb_do;
 
 struct RuntimeStatus {
@@ -474,81 +468,6 @@ bool readDO(float& do_mg, float& tC){
     return false;
   }
 }
-
-// =======================
-//  PEMBACAAN RK500-09 MULTI SENSOR
-// =======================
-//
-// Mapping index register dari manual RK500-09:
-// idx 0:  Temp value,  idx 1: Temp dec
-// idx 6:  EC value,    idx 7: EC dec
-// idx 8:  pH value,    idx 9: pH dec
-// idx 12: DO value,    idx 13: DO dec
-// idx 14: NH4 value,   idx 15: NH4 dec
-// idx 34: Sal value,   idx 35: Sal dec
-// idx 36: TDS value,   idx 37: TDS dec
-//
-// Nilai akhir = value / (10^dec)
-//
-
-static bool readRK50009(DisplayData& cur) {
-  // Baca 0x002A (42) register mulai address 0
-  uint8_t res = mb_rk.readHoldingRegisters(0x0000, 0x002A);
-  if (res != mb_rk.ku8MBSuccess) {
-    // kalau gagal, tandai semua parameter dari RK500-09 sebagai invalid
-    cur.ph_ok  = false;
-    cur.ec_ok  = false;
-    cur.do_ok  = false;
-    cur.nh4_ok = false;
-    return false;
-  }
-
-  auto val_dec = [&](uint16_t idxVal, uint16_t idxDec) -> float {
-    uint16_t rawVal = mb_rk.getResponseBuffer(idxVal);
-    uint16_t rawDec = mb_rk.getResponseBuffer(idxDec);
-    float scale = pow10u(rawDec);
-    return rawVal / (scale > 0.0f ? scale : 1.0f);
-  };
-
-  // === SUHU INTERNAL RK500-09 ===
-  float t_rk  = val_dec(0, 1);   // <-- suhu dari RK500-09 (INI YANG AKAN KITA PAKAI)
-
-  // Parameter utama
-  float ec    = val_dec(6, 7);    // uS/cm
-  float ph    = val_dec(8, 9);    // pH
-  float do_mg = val_dec(12, 13);  // mg/L
-  float nh4   = val_dec(14, 15);  // mg/L
-  float sal   = val_dec(34, 35);  // PSU
-  float tds   = val_dec(36, 37);  // mg/L
-
-  // ===== MASUKKAN KE DisplayData =====
-
-  // 1) SUHU UTAMA ALAT
-  //    t_ds sekarang DIISI dari RK500-09, bukan dari DS18B20
-  cur.t_ds   = t_rk;
-
-  // 2) Parameter lain
-  cur.ec     = ec;
-  cur.ph     = ph;
-  cur.do_mgL = do_mg;
-  cur.nh4    = nh4;
-  cur.sal    = sal;
-  cur.tds    = tds;
-
-  // 3) Simpan juga sebagai suhu internal sensor-sensor (kalau mau dipakai di kalibrasi)
-  cur.phT    = t_rk;
-  cur.ecT    = t_rk;
-  cur.do_tC  = t_rk;
-  cur.nh4T   = t_rk;
-
-  cur.ph_ok  = true;
-  cur.ec_ok  = true;
-  cur.do_ok  = true;
-  cur.nh4_ok = true;
-
-  return true;
-}
-
 
 // =======================
 //  MODBUS WRITE HELPER (Calib)
@@ -1028,21 +947,17 @@ void TaskSensors(void* param){
     mb.preTransmission(rs485Transmit);
     mb.postTransmission(rs485Receive);
   };
-
-  // Multi-parameter RK500-09 (address 0x06)
-  bindNode(mb_rk, RK_SLAVE_ID);
-
-  // (opsional) legacy node untuk menu kalibrasi lama – tidak dibaca lagi periodik
   bindNode(mb_ph,  PH_SLAVE_ID);
   bindNode(mb_ec,  EC_SLAVE_ID);
   bindNode(mb_nh4, NH4_SLAVE_ID);
   bindNode(mb_do,  DO_SLAVE_ID);
 
   DisplayData cur = {};
-  const TickType_t rsLockTimeout = pdMS_TO_TICKS(100);
+  uint8_t slot = 0;
+  const TickType_t rsLockTimeout = pdMS_TO_TICKS(50);
 
   for(;;){
-    // 1) Proses perintah kalibrasi (kalau kamu masih pakai menu lama)
+    // proses perintah kalibrasi jika ada
     CalibMsg msg;
     while (xQueueReceive(args->qCalib, &msg, 0) == pdTRUE){
       if (xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
@@ -1051,34 +966,53 @@ void TaskSensors(void* param){
       }
     }
 
-    // 2) Update suhu DS18B20 (non-blocking)
-    // ds.tick();
-    // float t = ds.temperatureC();
-    // if (!isnan(t)){
-    //   cur.t_ds = t;
-    // }
+    ds.tick();
+    float t = ds.temperatureC();
+    if (!isnan(t)){
+      cur.t_ds = t;
+    }
 
-    // 3) Baca semua parameter dari RK500-09 sekali jalan
     if (xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
-      readRK50009(cur);
+      switch (slot){
+        case 0: { // DO (ID 55)
+          float d_mg, d_t; bool ok = readDO(d_mg, d_t);
+          cur.do_ok = ok; if (ok){ cur.do_mgL = d_mg; cur.do_tC = d_t; }
+        } break;
+
+        case 1: { // pH (PH_SLAVE_ID)
+          float tp, v; bool ok = readPH(tp, v);
+          cur.ph_ok = ok; if (ok){ cur.phT = tp; cur.ph = v; }
+        } break;
+
+        case 2: { // EC/TDS/Sal (EC_SLAVE_ID)
+          float tec, ec, tds, sal; bool ok = readEC(tec, ec, tds, sal);
+          cur.ec_ok = ok; if (ok){ cur.ecT = tec; cur.ec = ec; cur.tds = tds; cur.sal = sal; }
+        } break;
+
+        case 3: { // NH4 (NH4_SLAVE_ID)
+          float nh4, tn; bool ok = readNH4(nh4, tn);
+          cur.nh4_ok = ok; if (ok){ cur.nh4 = nh4; cur.nh4T = tn; }
+        } break;
+      }
       rs485Receive();
       xSemaphoreGive(args->rs485);
     }
 
-    // 4) Tambahan: status WiFi, waktu, POST
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    slot = (slot + 1) & 0x03;
+
     cur.wifiOK = (WiFi.status()==WL_CONNECTED);
     EventBits_t flags = xEventGroupGetBits(args->flags);
     cur.ntpOK  = (flags & EG_TIME_OK);
     strncpy(cur.postStatus, args->status->postStatus, sizeof(cur.postStatus)-1);
     cur.postStatus[sizeof(cur.postStatus)-1] = '\0';
-    cur.mode = *(args->mode);   // hanya indikator di UI
+    cur.mode = *(args->mode);
 
-    // 5) Kirim snapshot ke UI & HTTP
     xQueueOverwrite(args->qDisplay, &cur);
     xQueueOverwrite(args->qTelemetry, &cur);
 
-    // 6) Delay sampling
-    vTaskDelay(pdMS_TO_TICKS(250));   // 4 Hz; silakan sesuaikan
+    vTaskDelay(pdMS_TO_TICKS(25));
   }
 }
 
@@ -1191,6 +1125,7 @@ void TaskHTTP(void* param){
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
+
 
 // void TaskHTTP(void* param){
 //   auto* args = static_cast<TaskHTTPArgs*>(param);
