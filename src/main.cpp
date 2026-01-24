@@ -1,20 +1,21 @@
 /*
  * Aerasea RTOS UI – ESP32-S3
  * Versi: 4 tombol (UP, DOWN, OK, BACK), tanpa encoder
- * Display: OLED 0.9" SSD1306 128x64 (I2C)
+ * Display: TFT ILI9341 320x240 (SPI)
  * PlatformIO Version
  */
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <U8g2lib.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ModbusMaster.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <WiFiManager.h>
+#include <WiFiManager.h>  
 #include <time.h>
 #include <math.h>
 #include "ui_types.h"
@@ -24,17 +25,32 @@
 //  KONFIG PERANGKAT & NET
 // =======================
 
-// OLED driver: sekarang pakai SSD1306 (0.9" / 0.96")
-// #define OLED_DRIVER_SH1106
-#define OLED_DRIVER_SSD1306
+// TFT ILI9341 (SPI) - landscape
+static const uint8_t TFT_ROTATION = 1;
 
-// I2C
-static const int SDA_PIN = 8;
-static const int SCL_PIN = 9;
-static const uint32_t I2C_FREQ = 400000;
+// TFT pin mapping (ESP32-S3)
+#define TFT_CS   10   // Chip Select
+#define TFT_DC   9    // Data/Command
+#define TFT_RST  8    // Reset (connect to 3.3V if LCD has reset pin)
+#define TFT_MOSI 11
+#define TFT_MISO 13
+#define TFT_SCK  12
+
+// 16-bit color aliases (RGB565)
+#define TFT_BLACK     0x0000
+#define TFT_NAVY      0x000F
+#define TFT_DARKGREY  0x7BEF
+#define TFT_LIGHTGREY 0xC618
+#define TFT_WHITE     0xFFFF
+#define TFT_ORANGE    0xFD20
+#define TFT_YELLOW    0xFFE0
+#define TFT_CYAN      0x07FF
+#define TFT_GREEN     0x07E0
+#define TFT_BLUE      0x001F
+#define TFT_MAGENTA   0xF81F
 
 // DS18B20
-#define DS18B20_PIN 13
+#define DS18B20_PIN 18
 
 // RS485 (shared bus)
 #define RS485_RX_PIN    16
@@ -78,16 +94,44 @@ const int   DAYLIGHT_OFF = 0;
 #define BTN_UP     5
 #define BTN_DOWN   6
 #define BTN_OK     7
-#define BTN_BACK   10
+#define BTN_BACK   17
 
 // =======================
 //  OBJEK GLOBAL
 // =======================
-#ifdef OLED_DRIVER_SH1106
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
-#else
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
-#endif
+class TFTWrapper : public Adafruit_ILI9341 {
+public:
+  using Adafruit_ILI9341::Adafruit_ILI9341;
+
+  void setTextFont(uint8_t size) {
+    setTextSize(size);
+    setFont(NULL);
+  }
+
+  int16_t textWidth(const char* text, uint8_t size) {
+    setTextSize(size);
+    int16_t x1, y1;
+    uint16_t w, h;
+    getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+    return static_cast<int16_t>(w);
+  }
+
+  void drawString(const char* text, int16_t x, int16_t y) {
+    setCursor(x, y);
+    print(text);
+  }
+
+  void drawCentreString(const char* text, int16_t x, int16_t y, uint8_t size) {
+    setTextSize(size);
+    int16_t x1, y1;
+    uint16_t w, h;
+    getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+    setCursor(x - static_cast<int16_t>(w / 2), y);
+    print(text);
+  }
+};
+
+TFTWrapper tft(TFT_CS, TFT_DC, TFT_RST);
 
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
@@ -221,6 +265,13 @@ SensorMode gMode = SensorMode::PH;
 RuntimeStatus gStatus;
 AsyncDS18B20 dsAsync(ds18b20);
 
+// Battery sensor (SEN-0052)
+#define BAT_ADC_PIN 1
+static const float BAT_V_FULL   = 16.8f;
+static const float BAT_V_EMPTY  = 12.0f;
+static const float BAT_DIV_RATIO = 5.0f; // SEN-0052 typical 1/5 divider
+static const uint8_t BAT_SAMPLES = 8;
+
 TaskInputArgs   gInputArgs{};
 TaskUIArgs      gUIArgs{};
 TaskSensorArgs  gSensorArgs{};
@@ -342,6 +393,13 @@ bool postData(const DisplayData& s, RuntimeStatus& status) {
   payload += "\"tds\":"        + String(s.tds,    2)   + ",";
   payload += "\"ammonia\":"    + String(s.nh4,    3)   + ",";
   payload += "\"salinitas\":"  + String(s.sal,    2)   + ",";
+  if (s.bat_ok){
+    payload += "\"battery_v\":"   + String(s.bat_v,   2) + ",";
+    payload += "\"battery_pct\":" + String(s.bat_pct, 1) + ",";
+  } else {
+    payload += "\"battery_v\":null,";
+    payload += "\"battery_pct\":null,";
+  }
   payload += "\"timestamp\":\""+ ts                   + "\"";
   payload += "}";
 
@@ -369,6 +427,22 @@ bool postData(const DisplayData& s, RuntimeStatus& status) {
 // =======================
 //  PEMBACAAN SENSOR
 // =======================
+static bool readBattery(float& vbat, float& pct){
+  uint32_t acc = 0;
+  for (uint8_t i = 0; i < BAT_SAMPLES; ++i){
+    acc += analogReadMilliVolts(BAT_ADC_PIN);
+  }
+  float v_adc = (acc / static_cast<float>(BAT_SAMPLES)) / 1000.0f;
+  vbat = v_adc * BAT_DIV_RATIO;
+  if (vbat < 0.1f || isnan(vbat)){
+    pct = 0.0f;
+    return false;
+  }
+  pct = (vbat - BAT_V_EMPTY) * 100.0f / (BAT_V_FULL - BAT_V_EMPTY);
+  pct = constrain(pct, 0.0f, 100.0f);
+  return true;
+}
+
 float regsToFloatBE(uint16_t r0, uint16_t r1){
   uint8_t b[4] = { uint8_t(r0>>8), uint8_t(r0&0xFF), uint8_t(r1>>8), uint8_t(r1&0xFF) };
   float f;
@@ -687,102 +761,143 @@ const int WIFI_MGR_COUNT = sizeof(WIFI_MGR_ITEMS)/sizeof(WIFI_MGR_ITEMS[0]);
 // =======================
 //  DRAW HELPERS (UI)
 // =======================
+static void drawToastOverlay(){
+  if (!toastActive()){
+    return;
+  }
+  tft.fillRect(0, 24, 320, 18, TFT_ORANGE);
+  tft.setTextColor(TFT_BLACK, TFT_ORANGE);
+  tft.setTextFont(2);
+  tft.drawString(toastMsg, 6, 26);
+}
+
+static void drawStatusBar(const DisplayData& d){
+  tft.fillRect(0, 0, 320, 24, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.setTextFont(2);
+
+  char left[40];
+  snprintf(left, sizeof(left), "WiFi:%s NTP:%s POST:%s",
+           d.wifiOK ? "OK" : "--",
+           d.ntpOK  ? "OK" : "--",
+           d.postStatus);
+  tft.drawString(left, 6, 4);
+
+  char right[24];
+  if (d.bat_ok){
+    snprintf(right, sizeof(right), "BAT %d%% %.1fV",
+             static_cast<int>(d.bat_pct + 0.5f), d.bat_v);
+  } else {
+    snprintf(right, sizeof(right), "BAT --");
+  }
+  int16_t w = tft.textWidth(right, 2);
+  tft.drawString(right, 316 - w, 4);
+}
+
+static void drawMetricBox(int x, int y, int w, int h, const char* label, const char* value, uint16_t color){
+  tft.drawRect(x, y, w, h, TFT_DARKGREY);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString(label, x + 6, y + 4);
+  tft.setTextFont(4);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(value, x + 6, y + 24);
+}
+
 void drawSplashFrame(uint8_t pct, bool wifiOK, bool ntpOK){
-  uint8_t contrast = map(pct, 0, 100, 16, 255);
-  u8g2.setContrast(contrast);
+  const uint16_t splashBg = tft.color565(0x19, 0x8A, 0xFF);
+  tft.fillScreen(splashBg);
 
-  u8g2.clearBuffer();
-  int x = (128 - AERASEA_LOGO_WIDTH)  / 2;
-  int y = (64  - AERASEA_LOGO_HEIGHT) / 2 - 6;
-  u8g2.drawXBMP(x, y, AERASEA_LOGO_WIDTH, AERASEA_LOGO_HEIGHT, aerasea_logo_128x64_inverted_bits);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, splashBg);
+  tft.drawCentreString("Aerasea", 160, 10, 4);
 
-  u8g2.setFont(u8g2_font_6x12_tf);
+  int logoX = (320 - AERASEA_LOGO_WIDTH) / 2;
+  int logoY = 40;
+  tft.drawXBitmap(logoX, logoY, aerasea_logo_128x64_inverted_bits,
+                  AERASEA_LOGO_WIDTH, AERASEA_LOGO_HEIGHT, TFT_WHITE);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, splashBg);
   char ln1[28]; snprintf(ln1, sizeof(ln1), "UID: %s", UID);
   char ln2[20]; snprintf(ln2, sizeof(ln2), "FW : %s", FW_VERSION);
-  u8g2.drawStr(0, 54, ln1);
-  u8g2.drawStr(0, 64, ln2);
+  tft.drawCentreString(ln1, 160, 115, 2);
+  tft.drawCentreString(ln2, 160, 135, 2);
 
-  u8g2.setFont(u8g2_font_5x8_tr);
-  u8g2.drawStr(80, 54, wifiOK ? "WiFi:OK" : "WiFi:--");
-  u8g2.drawStr(80, 63, ntpOK  ? "NTP:OK"  : "NTP:--");
+  tft.setTextColor(TFT_WHITE, splashBg);
+  tft.drawCentreString(wifiOK ? "WiFi: OK" : "WiFi: --", 110, 158, 2);
+  tft.drawCentreString(ntpOK  ? "NTP: OK"  : "NTP: --", 210, 158, 2);
 
-  u8g2.sendBuffer();
+  tft.drawRect(40, 190, 240, 14, TFT_WHITE);
+  tft.fillRect(42, 192, map(pct, 0, 100, 0, 236), 10, TFT_WHITE);
 }
 
 void drawDashboard(const DisplayData& d){
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
+  tft.fillScreen(TFT_BLACK);
+  drawStatusBar(d);
 
-  char buf[32];
+  const int gap = 6;
+  const int colW = (320 - gap * 3) / 2;
+  const int rowH = 60;
+  const int y0 = 28;
 
-  snprintf(buf, sizeof(buf), "T: %.2f C", d.t_ds);
-  u8g2.drawStr(0, 10, buf);
+  char buf[24];
 
-  if (d.do_ok) snprintf(buf, sizeof(buf), "DO: %.2f mg/L", d.do_mgL);
-  else         snprintf(buf, sizeof(buf), "DO: ---");
-  u8g2.drawStr(0, 22, buf);
+  snprintf(buf, sizeof(buf), "%.2f C", d.t_ds);
+  drawMetricBox(gap, y0, colW, rowH, "Temperature", buf, TFT_YELLOW);
 
-  if (d.ph_ok) snprintf(buf, sizeof(buf), "pH: %.2f", d.ph);
-  else         snprintf(buf, sizeof(buf), "pH: ---");
-  u8g2.drawStr(0, 34, buf);
+  if (d.do_ok) snprintf(buf, sizeof(buf), "%.2f mg/L", d.do_mgL);
+  else         snprintf(buf, sizeof(buf), "--");
+  drawMetricBox(gap * 2 + colW, y0, colW, rowH, "Dissolved O2", buf, TFT_CYAN);
 
-  if (d.ec_ok) snprintf(buf, sizeof(buf), "EC: %.0f uS/cm", d.ec);
-  else         snprintf(buf, sizeof(buf), "EC: ---");
-  u8g2.drawStr(0, 46, buf);
+  if (d.ph_ok) snprintf(buf, sizeof(buf), "%.2f", d.ph);
+  else         snprintf(buf, sizeof(buf), "--");
+  drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", buf, TFT_GREEN);
 
-  if (d.nh4_ok) snprintf(buf, sizeof(buf), "NH4: %.2f mg/L", d.nh4);
-  else          snprintf(buf, sizeof(buf), "NH4: ---");
-  u8g2.drawStr(0, 58, buf);
+  if (d.nh4_ok) snprintf(buf, sizeof(buf), "%.2f mg/L", d.nh4);
+  else          snprintf(buf, sizeof(buf), "--");
+  drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "NH4", buf, TFT_ORANGE);
 
-  u8g2.setFont(u8g2_font_5x8_tr);
-  snprintf(buf, sizeof(buf), "WiFi:%s NTP:%s POST:%s",
-           d.wifiOK ? "OK":"--",
-           d.ntpOK  ? "OK":"--",
-           d.postStatus);
-  u8g2.drawStr(0, 64, buf);
+  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f uS/cm", d.ec);
+  else         snprintf(buf, sizeof(buf), "--");
+  drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", buf, TFT_BLUE);
 
-  if (toastActive()){
-    u8g2.setDrawColor(1);
-    u8g2.drawBox(0, 0, 128, 10);
-    u8g2.setDrawColor(0);
-    u8g2.setFont(u8g2_font_5x8_tr);
-    u8g2.drawStr(2, 8, toastMsg);
-    u8g2.setDrawColor(1);
-  }
+  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f mg/L", d.tds);
+  else         snprintf(buf, sizeof(buf), "--");
+  drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", buf, TFT_MAGENTA);
 
-  u8g2.sendBuffer();
+  tft.fillRect(0, 220, 320, 20, TFT_NAVY);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextFont(2);
+  const char* modeStr = (d.mode == SensorMode::PH) ? "Mode: pH" :
+                        (d.mode == SensorMode::EC) ? "Mode: EC" : "Mode: NH4";
+  tft.drawString(modeStr, 6, 224);
+
+  drawToastOverlay();
 }
 
 void drawMenu(const char* title, const char* items[], int nItems, int cursor){
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
+  tft.fillScreen(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 24, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.setTextFont(2);
+  tft.drawString(title, 6, 4);
 
-  u8g2.drawStr(0, 10, title);
-  u8g2.drawHLine(0, 12, 128);
-
-  int y = 24;
+  int y = 34;
+  const int itemH = 28;
   for (int i = 0; i < nItems; ++i){
     if (i == cursor){
-      u8g2.drawBox(0, y-9, 128, 11);
-      u8g2.setDrawColor(0);
-      u8g2.drawStr(2, y, items[i]);
-      u8g2.setDrawColor(1);
+      tft.fillRect(6, y - 4, 308, itemH, TFT_BLUE);
+      tft.setTextColor(TFT_WHITE, TFT_BLUE);
     } else {
-      u8g2.drawStr(2, y, items[i]);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
     }
-    y += 12;
+    tft.setTextFont(2);
+    tft.drawString(items[i], 12, y);
+    y += itemH;
   }
 
-  if (toastActive()){
-    u8g2.setDrawColor(1);
-    u8g2.drawBox(0, 0, 128, 10);
-    u8g2.setDrawColor(0);
-    u8g2.setFont(u8g2_font_5x8_tr);
-    u8g2.drawStr(2, 8, toastMsg);
-    u8g2.setDrawColor(1);
-  }
-
-  u8g2.sendBuffer();
+  drawToastOverlay();
 }
 
 // =======================
@@ -839,10 +954,18 @@ void TaskUI(void* param){
   uint8_t splashPct = 0;
   uint32_t tSplash = millis();
   UIState ui = UIState::DASHBOARD;
+  bool lastWifiOK = false;
+  bool lastNtpOK = false;
+  bool lastToastActive = false;
+  char lastToastMsg[sizeof(toastMsg)] = {0};
 
   for(;;){
+    bool gotInput = false;
+    bool gotDisplay = false;
+
     InputEvent ev;
     while (xQueueReceive(args->qInput, &ev, 0) == pdTRUE){
+      gotInput = true;
       if (ev.type == ENC_DELTA){
         int dir = (ev.value > 0) ? 1 : -1;
         switch (ui){
@@ -973,37 +1096,58 @@ void TaskUI(void* param){
     if (xQueueReceive(args->qDisplay, &tmp, 0) == pdTRUE){
       disp = tmp;
       disp.mode = *(args->mode);
+      gotDisplay = true;
     }
 
     EventBits_t flags = xEventGroupGetBits(args->flags);
     bool wifiOK = (flags & EG_WIFI_OK);
     bool ntpOK  = (flags & EG_TIME_OK);
+    bool toastNow = toastActive();
+    bool toastChanged = (toastNow != lastToastActive) ||
+                        (strncmp(toastMsg, lastToastMsg, sizeof(toastMsg)) != 0);
 
     uint32_t now = millis();
-    if (now - tSplash < 2000){
+    bool inSplash = (now - tSplash < 2000);
+    bool needDraw = gotInput || gotDisplay || toastChanged ||
+                    (wifiOK != lastWifiOK) || (ntpOK != lastNtpOK);
+
+    if (inSplash){
       if (splashPct < 100 && now - tSplash > splashPct*10){
         splashPct++;
+        needDraw = true;
       }
-      drawSplashFrame(splashPct, wifiOK, ntpOK);
+      if (needDraw){
+        drawSplashFrame(splashPct, wifiOK, ntpOK);
+      }
     } else {
-      switch (ui){
-        case UIState::DASHBOARD:   drawDashboard(disp); break;
-        case UIState::MENU:        drawMenu("Main Menu", MAIN_ITEMS, MAIN_COUNT, menuCursor); break;
-        case UIState::SENSOR_MODE: drawMenu("Sensor Mode", MODE_ITEMS, MODE_COUNT, modeCursor); break;
-        case UIState::CALIB:       drawMenu("Kalibrasi Sensor", CAL_ITEMS, CAL_COUNT, calCursor); break;
-        case UIState::CAL_EC:      drawMenu("Cal EC (Auto)", EC_CAL_ITEMS, EC_CAL_COUNT, ecCalCursor); break;
-        case UIState::CAL_NH4:     drawMenu("Cal NH4", NH4_CAL_ITEMS, NH4_CAL_COUNT, nh4CalCursor); break;
-        case UIState::CAL_DO:      drawMenu("Cal DO", DO_CAL_ITEMS, DO_CAL_COUNT, doCalCursor); break;
-        case UIState::CAL_PH:      drawMenu("Cal pH (S-PH-01)", PH_CAL_ITEMS, PH_CAL_COUNT, phCalCursor); break;
-        case UIState::WIFI_MGR:    drawMenu("WiFi Manager", WIFI_MGR_ITEMS, WIFI_MGR_COUNT, 0); break;
+      if (needDraw){
+        switch (ui){
+          case UIState::DASHBOARD:   drawDashboard(disp); break;
+          case UIState::MENU:        drawMenu("Main Menu", MAIN_ITEMS, MAIN_COUNT, menuCursor); break;
+          case UIState::SENSOR_MODE: drawMenu("Sensor Mode", MODE_ITEMS, MODE_COUNT, modeCursor); break;
+          case UIState::CALIB:       drawMenu("Kalibrasi Sensor", CAL_ITEMS, CAL_COUNT, calCursor); break;
+          case UIState::CAL_EC:      drawMenu("Cal EC (Auto)", EC_CAL_ITEMS, EC_CAL_COUNT, ecCalCursor); break;
+          case UIState::CAL_NH4:     drawMenu("Cal NH4", NH4_CAL_ITEMS, NH4_CAL_COUNT, nh4CalCursor); break;
+          case UIState::CAL_DO:      drawMenu("Cal DO", DO_CAL_ITEMS, DO_CAL_COUNT, doCalCursor); break;
+          case UIState::CAL_PH:      drawMenu("Cal pH (S-PH-01)", PH_CAL_ITEMS, PH_CAL_COUNT, phCalCursor); break;
+          case UIState::WIFI_MGR:    drawMenu("WiFi Manager", WIFI_MGR_ITEMS, WIFI_MGR_COUNT, 0); break;
+        }
       }
     }
 
-    if (!toastActive()){
+    if (!toastNow){
       clearToast();
     }
 
-    vTaskDelay(pdMS_TO_TICKS(40));
+    if (needDraw){
+      lastWifiOK = wifiOK;
+      lastNtpOK = ntpOK;
+      lastToastActive = toastNow;
+      strncpy(lastToastMsg, toastMsg, sizeof(lastToastMsg)-1);
+      lastToastMsg[sizeof(lastToastMsg)-1] = '\0';
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -1063,6 +1207,17 @@ void TaskSensors(void* param){
       readRK50009(cur);
       rs485Receive();
       xSemaphoreGive(args->rs485);
+    }
+
+    float vbat = 0.0f;
+    float batPct = 0.0f;
+    cur.bat_ok = readBattery(vbat, batPct);
+    if (cur.bat_ok){
+      cur.bat_v = vbat;
+      cur.bat_pct = batPct;
+    } else {
+      cur.bat_v = 0.0f;
+      cur.bat_pct = 0.0f;
     }
 
     // 4) Tambahan: status WiFi, waktu, POST
@@ -1285,11 +1440,23 @@ void setup(){
   Serial.begin(115200);
   delay(100);
 
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(I2C_FREQ);
-  u8g2.begin();
-  u8g2.clearBuffer();
-  u8g2.sendBuffer();
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
+  tft.begin();
+  tft.setRotation(TFT_ROTATION);
+  tft.invertDisplay(1);
+  tft.setTextWrap(false);
+  tft.fillScreen(TFT_BLACK);
+#ifdef TFT_BL
+  pinMode(TFT_BL, OUTPUT);
+#ifdef TFT_BACKLIGHT_ON
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+#else
+  digitalWrite(TFT_BL, HIGH);
+#endif
+#endif
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
 
   qInput     = xQueueCreate(16, sizeof(InputEvent));
   qDisplay   = xQueueCreate(1,  sizeof(DisplayData));

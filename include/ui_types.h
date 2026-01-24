@@ -35,6 +35,10 @@ struct DisplayData {
   bool  nh4_ok;            // true kalau pembacaan NH4 sukses
   bool  do_ok;             // true kalau pembacaan DO sukses
 
+  float bat_v;             // Tegangan baterai (V)
+  float bat_pct;           // Persentase baterai (0-100)
+  bool  bat_ok;            // true kalau pembacaan baterai valid
+
   SensorMode mode;         // Hanya indikator mode di UI
 
   bool  wifiOK;            // Status WiFi

@@ -1,6 +1,6 @@
 # Aquanotes Triangle (ESP32-S3)
 
-UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan OLED SSD1306 128x64. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), DO (S-RJY-01) dan suhu DS18B20, lalu menampilkan ke OLED serta mengirim telemetry ke server HTTP.
+UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), DO (S-RJY-01) dan suhu DS18B20, lalu menampilkan ke TFT serta mengirim telemetry ke server HTTP.
 
 ## Build & Flash (PlatformIO)
 - Prasyarat: PlatformIO CLI atau VSCode + PlatformIO.
@@ -27,6 +27,32 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan OLED SSD1306 128x64
   - Cal pH (S-PH-01): pH 4.01 / 7.00 / 10.01 atau pengaturan kompensasi suhu (External/Off/Onboard).
   - BACK di submenu manapun: kembali ke dashboard.
 
+## Pinout & Wiring (ESP32-S3)
+### TFT ILI9341 (SPI)
+- TFT_CS: GPIO10
+- TFT_DC: GPIO9
+- TFT_RST: GPIO8
+- TFT_MOSI: GPIO11
+- TFT_MISO: GPIO13 (opsional, biasanya tidak dipakai oleh ILI9341)
+- TFT_SCK: GPIO12
+
+### Tombol (aktif LOW, INPUT_PULLUP)
+- BTN_UP: GPIO5
+- BTN_DOWN: GPIO6
+- BTN_OK: GPIO7
+- BTN_BACK: GPIO17
+
+### RS485
+- RS485_RX: GPIO16
+- RS485_TX: GPIO15
+- RS485_DE/RE: GPIO14
+
+### DS18B20
+- DATA: GPIO18
+
+### Battery Sense (SEN-0052)
+- BAT_ADC_PIN: GPIO1 (analog)
+
 ## Telemetry HTTP
 - Endpoint: `https://aeraseaku.inkubasistartupunhas.id/sensor/`
 - Payload: JSON berisi UID, suhu, pH, DO, TDS, NH4, salinitas, timestamp.
@@ -40,7 +66,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan OLED SSD1306 128x64
 ### Flowchart Utama
 ```mermaid
 flowchart TD
-  A[Boot ESP32-S3] --> B[Init I2C/OLED/Queues/Tasks]
+  A[Boot ESP32-S3] --> B[Init SPI/TFT/Queues/Tasks]
   B --> C[TaskInput]
   B --> D[TaskUI]
   B --> E[TaskSensors]
@@ -54,7 +80,7 @@ flowchart TD
 ### Block Diagram
 ```mermaid
 graph LR
-  MCU[ESP32-S3] --- OLED[OLED SSD1306]
+  MCU[ESP32-S3] --- TFT[TFT ILI9341]
   MCU --- Buttons[UP/DOWN/OK/BACK]
   MCU --- DS18B20
   MCU --- RS485
