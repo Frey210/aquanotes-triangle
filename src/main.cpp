@@ -52,6 +52,18 @@ static const uint8_t TFT_ROTATION = 1;
 // DS18B20
 #define DS18B20_PIN 18
 
+// RGB LED (common cathode)
+#define LED_R_PIN 2
+#define LED_G_PIN 3
+#define LED_B_PIN 4
+
+// LEDC (PWM) channels
+#define LEDC_CH_R 0
+#define LEDC_CH_G 1
+#define LEDC_CH_B 2
+#define LEDC_FREQ 5000
+#define LEDC_RES  8
+
 // RS485 (shared bus)
 #define RS485_RX_PIN    16
 #define RS485_TX_PIN    15
@@ -189,7 +201,6 @@ struct TaskUIArgs {
   QueueHandle_t qDisplay;
   QueueHandle_t qCalib;
   EventGroupHandle_t flags;
-  SensorMode* mode;
 };
 
 struct TaskSensorArgs {
@@ -198,7 +209,6 @@ struct TaskSensorArgs {
   QueueHandle_t qCalib;
   SemaphoreHandle_t rs485;
   EventGroupHandle_t flags;
-  SensorMode* mode;
   RuntimeStatus* status;
   AsyncDS18B20* ds;
 };
@@ -261,7 +271,6 @@ static const uint16_t REG_DO_SLOPE      = 0x1003; // write 0
 // =======================
 //  GLOBAL STATUS
 // =======================
-SensorMode gMode = SensorMode::PH;
 RuntimeStatus gStatus;
 AsyncDS18B20 dsAsync(ds18b20);
 
@@ -278,7 +287,7 @@ TaskSensorArgs  gSensorArgs{};
 TaskHTTPArgs    gHTTPArgs{};
 
 // Menu cursors
-int menuCursor=0, modeCursor=0, calCursor=0, ecCalCursor=0, nh4CalCursor=0, doCalCursor=0, phCalCursor=0;
+int menuCursor=0, calCursor=0, ecCalCursor=0, nh4CalCursor=0, doCalCursor=0, phCalCursor=0;
 
 // Toast (non-blocking)
 static uint32_t toastUntil = 0;
@@ -702,13 +711,9 @@ bool debounceRead(uint8_t pin){
 const char* MAIN_ITEMS[] = {
   "Dashboard",
   "WiFi Manager",
-  "Kalibrasi Sensor",
-  "Sensor Mode"
+  "Kalibrasi Sensor"
 };
 const int MAIN_COUNT = sizeof(MAIN_ITEMS)/sizeof(MAIN_ITEMS[0]);
-
-const char* MODE_ITEMS[] = { "pH Sensor", "EC Sensor", "NH4 Sensor" };
-const int MODE_COUNT = sizeof(MODE_ITEMS)/sizeof(MODE_ITEMS[0]);
 
 const char* CAL_ITEMS[] = {
   "Cal EC (Auto)",
@@ -761,6 +766,43 @@ const int WIFI_MGR_COUNT = sizeof(WIFI_MGR_ITEMS)/sizeof(WIFI_MGR_ITEMS[0]);
 // =======================
 //  DRAW HELPERS (UI)
 // =======================
+struct DashboardCache {
+  char temp[16];
+  char do_mg[16];
+  char ph[16];
+  char nh4[16];
+  char ec[16];
+  char tds[16];
+  char statusLeft[48];
+  char statusRight[24];
+  bool valid = false;
+};
+
+static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
+  snprintf(out.temp, sizeof(out.temp), "%.2f C", d.t_ds);
+  if (d.do_ok)  snprintf(out.do_mg, sizeof(out.do_mg), "%.2f mg/L", d.do_mgL);
+  else          snprintf(out.do_mg, sizeof(out.do_mg), "--");
+  if (d.ph_ok)  snprintf(out.ph, sizeof(out.ph), "%.2f", d.ph);
+  else          snprintf(out.ph, sizeof(out.ph), "--");
+  if (d.nh4_ok) snprintf(out.nh4, sizeof(out.nh4), "%.2f mg/L", d.nh4);
+  else          snprintf(out.nh4, sizeof(out.nh4), "--");
+  if (d.ec_ok)  snprintf(out.ec, sizeof(out.ec), "%.0f uS/cm", d.ec);
+  else          snprintf(out.ec, sizeof(out.ec), "--");
+  if (d.ec_ok)  snprintf(out.tds, sizeof(out.tds), "%.0f mg/L", d.tds);
+  else          snprintf(out.tds, sizeof(out.tds), "--");
+
+  snprintf(out.statusLeft, sizeof(out.statusLeft), "WiFi:%s NTP:%s POST:%s",
+           d.wifiOK ? "OK" : "--",
+           d.ntpOK  ? "OK" : "--",
+           d.postStatus);
+  if (d.bat_ok){
+    snprintf(out.statusRight, sizeof(out.statusRight), "BAT %d%% %.1fV",
+             static_cast<int>(d.bat_pct + 0.5f), d.bat_v);
+  } else {
+    snprintf(out.statusRight, sizeof(out.statusRight), "BAT --");
+  }
+}
+
 static void drawToastOverlay(){
   if (!toastActive()){
     return;
@@ -776,22 +818,12 @@ static void drawStatusBar(const DisplayData& d){
   tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
   tft.setTextFont(2);
 
-  char left[40];
-  snprintf(left, sizeof(left), "WiFi:%s NTP:%s POST:%s",
-           d.wifiOK ? "OK" : "--",
-           d.ntpOK  ? "OK" : "--",
-           d.postStatus);
-  tft.drawString(left, 6, 4);
+  DashboardCache tmp{};
+  formatDashboardStrings(d, tmp);
+  tft.drawString(tmp.statusLeft, 6, 4);
 
-  char right[24];
-  if (d.bat_ok){
-    snprintf(right, sizeof(right), "BAT %d%% %.1fV",
-             static_cast<int>(d.bat_pct + 0.5f), d.bat_v);
-  } else {
-    snprintf(right, sizeof(right), "BAT --");
-  }
-  int16_t w = tft.textWidth(right, 2);
-  tft.drawString(right, 316 - w, 4);
+  int16_t w = tft.textWidth(tmp.statusRight, 2);
+  tft.drawString(tmp.statusRight, 316 - w, 4);
 }
 
 static void drawMetricBox(int x, int y, int w, int h, const char* label, const char* value, uint16_t color){
@@ -832,7 +864,7 @@ void drawSplashFrame(uint8_t pct, bool wifiOK, bool ntpOK){
   tft.fillRect(42, 192, map(pct, 0, 100, 0, 236), 10, TFT_WHITE);
 }
 
-void drawDashboard(const DisplayData& d){
+static void drawDashboardFrame(const DisplayData& d){
   tft.fillScreen(TFT_BLACK);
   drawStatusBar(d);
 
@@ -866,13 +898,44 @@ void drawDashboard(const DisplayData& d){
   else         snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", buf, TFT_MAGENTA);
 
-  tft.fillRect(0, 220, 320, 20, TFT_NAVY);
-  tft.setTextColor(TFT_WHITE, TFT_NAVY);
-  tft.setTextFont(2);
-  const char* modeStr = (d.mode == SensorMode::PH) ? "Mode: pH" :
-                        (d.mode == SensorMode::EC) ? "Mode: EC" : "Mode: NH4";
-  tft.drawString(modeStr, 6, 224);
+  drawToastOverlay();
+}
 
+static void drawDashboardUpdate(const DisplayData& d, DashboardCache& cache, bool force){
+  DashboardCache now{};
+  formatDashboardStrings(d, now);
+
+  if (force || !cache.valid || strncmp(cache.statusLeft, now.statusLeft, sizeof(now.statusLeft)) != 0 ||
+      strncmp(cache.statusRight, now.statusRight, sizeof(now.statusRight)) != 0){
+    drawStatusBar(d);
+  }
+
+  const int gap = 6;
+  const int colW = (320 - gap * 3) / 2;
+  const int rowH = 60;
+  const int y0 = 28;
+
+  if (force || !cache.valid || strncmp(cache.temp, now.temp, sizeof(now.temp)) != 0){
+    drawMetricBox(gap, y0, colW, rowH, "Temperature", now.temp, TFT_YELLOW);
+  }
+  if (force || !cache.valid || strncmp(cache.do_mg, now.do_mg, sizeof(now.do_mg)) != 0){
+    drawMetricBox(gap * 2 + colW, y0, colW, rowH, "Dissolved O2", now.do_mg, TFT_CYAN);
+  }
+  if (force || !cache.valid || strncmp(cache.ph, now.ph, sizeof(now.ph)) != 0){
+    drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", now.ph, TFT_GREEN);
+  }
+  if (force || !cache.valid || strncmp(cache.nh4, now.nh4, sizeof(now.nh4)) != 0){
+    drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "NH4", now.nh4, TFT_ORANGE);
+  }
+  if (force || !cache.valid || strncmp(cache.ec, now.ec, sizeof(now.ec)) != 0){
+    drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", now.ec, TFT_BLUE);
+  }
+  if (force || !cache.valid || strncmp(cache.tds, now.tds, sizeof(now.tds)) != 0){
+    drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", now.tds, TFT_MAGENTA);
+  }
+
+  cache = now;
+  cache.valid = true;
   drawToastOverlay();
 }
 
@@ -898,6 +961,40 @@ void drawMenu(const char* title, const char* items[], int nItems, int cursor){
   }
 
   drawToastOverlay();
+}
+
+static void drawMenuItem(const char* items[], int index, bool selected){
+  const int itemH = 28;
+  const int y = 34 + index * itemH;
+  tft.fillRect(6, y - 4, 308, itemH, selected ? TFT_BLUE : TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, selected ? TFT_BLUE : TFT_BLACK);
+  tft.setTextFont(2);
+  tft.drawString(items[index], 12, y);
+}
+
+// =======================
+//  LED INDICATOR (RGB)
+// =======================
+struct LedRGB {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
+
+static inline void ledWrite(const LedRGB& c){
+  ledcWrite(LEDC_CH_R, c.r);
+  ledcWrite(LEDC_CH_G, c.g);
+  ledcWrite(LEDC_CH_B, c.b);
+}
+
+static void ledInit(){
+  ledcSetup(LEDC_CH_R, LEDC_FREQ, LEDC_RES);
+  ledcSetup(LEDC_CH_G, LEDC_FREQ, LEDC_RES);
+  ledcSetup(LEDC_CH_B, LEDC_FREQ, LEDC_RES);
+  ledcAttachPin(LED_R_PIN, LEDC_CH_R);
+  ledcAttachPin(LED_G_PIN, LEDC_CH_G);
+  ledcAttachPin(LED_B_PIN, LEDC_CH_B);
+  ledWrite({0,0,0});
 }
 
 // =======================
@@ -945,23 +1042,37 @@ void TaskInput(void* param){
 // =======================
 void TaskUI(void* param){
   auto* args = static_cast<TaskUIArgs*>(param);
-  if (!args || !args->qInput || !args->qDisplay || !args->mode || !args->flags || !args->qCalib){
+  if (!args || !args->qInput || !args->qDisplay || !args->flags || !args->qCalib){
     vTaskDelete(NULL);
     return;
   }
 
   DisplayData disp = {};
+  DashboardCache dashCache{};
   uint8_t splashPct = 0;
   uint32_t tSplash = millis();
   UIState ui = UIState::DASHBOARD;
+  UIState lastUi = UIState::DASHBOARD;
   bool lastWifiOK = false;
   bool lastNtpOK = false;
   bool lastToastActive = false;
   char lastToastMsg[sizeof(toastMsg)] = {0};
+  char lastPostStatus[16] = {0};
+  int lastMenuCursor = menuCursor;
+  int lastCalCursor = calCursor;
+  int lastEcCalCursor = ecCalCursor;
+  int lastNh4CalCursor = nh4CalCursor;
+  int lastDoCalCursor = doCalCursor;
+  int lastPhCalCursor = phCalCursor;
+  uint8_t modbusFailStreak = 0;
+  uint8_t postErrStreak = 0;
+  uint32_t ledFlashUntil = 0;
+  LedRGB ledFlashColor{0,0,0};
 
   for(;;){
     bool gotInput = false;
     bool gotDisplay = false;
+    bool forceRedraw = false;
 
     InputEvent ev;
     while (xQueueReceive(args->qInput, &ev, 0) == pdTRUE){
@@ -971,9 +1082,6 @@ void TaskUI(void* param){
         switch (ui){
           case UIState::MENU:
             menuCursor = constrain(menuCursor + dir, 0, MAIN_COUNT-1);
-            break;
-          case UIState::SENSOR_MODE:
-            modeCursor = constrain(modeCursor + dir, 0, MODE_COUNT-1);
             break;
           case UIState::CALIB:
             calCursor = constrain(calCursor + dir, 0, CAL_COUNT-1);
@@ -994,7 +1102,7 @@ void TaskUI(void* param){
             break;
         }
       } else if (ev.type == BTN_PRESS){
-        if (ui==UIState::MENU || ui==UIState::WIFI_MGR || ui==UIState::SENSOR_MODE || ui==UIState::CALIB ||
+        if (ui==UIState::MENU || ui==UIState::WIFI_MGR || ui==UIState::CALIB ||
             ui==UIState::CAL_EC || ui==UIState::CAL_NH4 || ui==UIState::CAL_DO || ui==UIState::CAL_PH){
           if (ev.value==BTN_BACK){
             ui = UIState::DASHBOARD;
@@ -1014,17 +1122,7 @@ void TaskUI(void* param){
               case 0: ui = UIState::DASHBOARD;   break;
               case 1: ui = UIState::WIFI_MGR;    break;
               case 2: ui = UIState::CALIB;       break;
-              case 3: ui = UIState::SENSOR_MODE; break;
             }
-          }
-        } else if (ui == UIState::SENSOR_MODE){
-          if (ev.value == BTN_OK){
-            switch (modeCursor){
-              case 0: *(args->mode) = SensorMode::PH;  showToast("Mode: pH");  break;
-              case 1: *(args->mode) = SensorMode::EC;  showToast("Mode: EC");  break;
-              case 2: *(args->mode) = SensorMode::NH4; showToast("Mode: NH4"); break;
-            }
-            ui = UIState::DASHBOARD;
           }
         } else if (ui == UIState::WIFI_MGR){
           if (ev.value == BTN_OK){
@@ -1095,8 +1193,28 @@ void TaskUI(void* param){
     DisplayData tmp;
     if (xQueueReceive(args->qDisplay, &tmp, 0) == pdTRUE){
       disp = tmp;
-      disp.mode = *(args->mode);
       gotDisplay = true;
+
+      bool sensorsOK = disp.ph_ok && disp.ec_ok && disp.do_ok && disp.nh4_ok;
+      if (sensorsOK){
+        modbusFailStreak = 0;
+      } else if (modbusFailStreak < 255){
+        modbusFailStreak++;
+      }
+
+      bool postErr = (disp.postStatus[0] == 'E') || (strncmp(disp.postStatus, "HTTPERR", 7) == 0);
+      if (postErr){
+        if (postErrStreak < 255) postErrStreak++;
+      } else {
+        postErrStreak = 0;
+      }
+
+      if (strncmp(disp.postStatus, "OK", 2) == 0 && strncmp(lastPostStatus, "OK", 2) != 0){
+        ledFlashUntil = millis() + 300;
+        ledFlashColor = {0, 192, 192}; // cyan flash
+      }
+      strncpy(lastPostStatus, disp.postStatus, sizeof(lastPostStatus)-1);
+      lastPostStatus[sizeof(lastPostStatus)-1] = '\0';
     }
 
     EventBits_t flags = xEventGroupGetBits(args->flags);
@@ -1105,6 +1223,20 @@ void TaskUI(void* param){
     bool toastNow = toastActive();
     bool toastChanged = (toastNow != lastToastActive) ||
                         (strncmp(toastMsg, lastToastMsg, sizeof(toastMsg)) != 0);
+
+    if (toastChanged){
+      if (strncmp(toastMsg, "Cal OK", 6) == 0){
+        ledFlashUntil = millis() + 350;
+        ledFlashColor = {192, 0, 192}; // magenta flash
+      } else if (strncmp(toastMsg, "Cal Fail", 8) == 0){
+        ledFlashUntil = millis() + 400;
+        ledFlashColor = {192, 0, 0}; // red flash
+      }
+    }
+
+    if (!toastNow && toastChanged){
+      forceRedraw = true;
+    }
 
     uint32_t now = millis();
     bool inSplash = (now - tSplash < 2000);
@@ -1121,16 +1253,105 @@ void TaskUI(void* param){
       }
     } else {
       if (needDraw){
+        if (ui != lastUi){
+          forceRedraw = true;
+          lastUi = ui;
+          dashCache.valid = false;
+        }
+
         switch (ui){
-          case UIState::DASHBOARD:   drawDashboard(disp); break;
-          case UIState::MENU:        drawMenu("Main Menu", MAIN_ITEMS, MAIN_COUNT, menuCursor); break;
-          case UIState::SENSOR_MODE: drawMenu("Sensor Mode", MODE_ITEMS, MODE_COUNT, modeCursor); break;
-          case UIState::CALIB:       drawMenu("Kalibrasi Sensor", CAL_ITEMS, CAL_COUNT, calCursor); break;
-          case UIState::CAL_EC:      drawMenu("Cal EC (Auto)", EC_CAL_ITEMS, EC_CAL_COUNT, ecCalCursor); break;
-          case UIState::CAL_NH4:     drawMenu("Cal NH4", NH4_CAL_ITEMS, NH4_CAL_COUNT, nh4CalCursor); break;
-          case UIState::CAL_DO:      drawMenu("Cal DO", DO_CAL_ITEMS, DO_CAL_COUNT, doCalCursor); break;
-          case UIState::CAL_PH:      drawMenu("Cal pH (S-PH-01)", PH_CAL_ITEMS, PH_CAL_COUNT, phCalCursor); break;
-          case UIState::WIFI_MGR:    drawMenu("WiFi Manager", WIFI_MGR_ITEMS, WIFI_MGR_COUNT, 0); break;
+          case UIState::DASHBOARD:
+            if (forceRedraw){
+              drawDashboardFrame(disp);
+              dashCache.valid = false;
+            }
+            drawDashboardUpdate(disp, dashCache, forceRedraw);
+            break;
+          case UIState::MENU:
+            if (forceRedraw){
+              drawMenu("Main Menu", MAIN_ITEMS, MAIN_COUNT, menuCursor);
+              lastMenuCursor = menuCursor;
+            } else if (menuCursor != lastMenuCursor){
+              drawMenuItem(MAIN_ITEMS, lastMenuCursor, false);
+              drawMenuItem(MAIN_ITEMS, menuCursor, true);
+              lastMenuCursor = menuCursor;
+              drawToastOverlay();
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
+          case UIState::CALIB:
+            if (forceRedraw){
+              drawMenu("Kalibrasi Sensor", CAL_ITEMS, CAL_COUNT, calCursor);
+              lastCalCursor = calCursor;
+            } else if (calCursor != lastCalCursor){
+              drawMenuItem(CAL_ITEMS, lastCalCursor, false);
+              drawMenuItem(CAL_ITEMS, calCursor, true);
+              lastCalCursor = calCursor;
+              drawToastOverlay();
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
+          case UIState::CAL_EC:
+            if (forceRedraw){
+              drawMenu("Cal EC (Auto)", EC_CAL_ITEMS, EC_CAL_COUNT, ecCalCursor);
+              lastEcCalCursor = ecCalCursor;
+            } else if (ecCalCursor != lastEcCalCursor){
+              drawMenuItem(EC_CAL_ITEMS, lastEcCalCursor, false);
+              drawMenuItem(EC_CAL_ITEMS, ecCalCursor, true);
+              lastEcCalCursor = ecCalCursor;
+              drawToastOverlay();
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
+          case UIState::CAL_NH4:
+            if (forceRedraw){
+              drawMenu("Cal NH4", NH4_CAL_ITEMS, NH4_CAL_COUNT, nh4CalCursor);
+              lastNh4CalCursor = nh4CalCursor;
+            } else if (nh4CalCursor != lastNh4CalCursor){
+              drawMenuItem(NH4_CAL_ITEMS, lastNh4CalCursor, false);
+              drawMenuItem(NH4_CAL_ITEMS, nh4CalCursor, true);
+              lastNh4CalCursor = nh4CalCursor;
+              drawToastOverlay();
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
+          case UIState::CAL_DO:
+            if (forceRedraw){
+              drawMenu("Cal DO", DO_CAL_ITEMS, DO_CAL_COUNT, doCalCursor);
+              lastDoCalCursor = doCalCursor;
+            } else if (doCalCursor != lastDoCalCursor){
+              drawMenuItem(DO_CAL_ITEMS, lastDoCalCursor, false);
+              drawMenuItem(DO_CAL_ITEMS, doCalCursor, true);
+              lastDoCalCursor = doCalCursor;
+              drawToastOverlay();
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
+          case UIState::CAL_PH:
+            if (forceRedraw){
+              drawMenu("Cal pH (S-PH-01)", PH_CAL_ITEMS, PH_CAL_COUNT, phCalCursor);
+              lastPhCalCursor = phCalCursor;
+            } else if (phCalCursor != lastPhCalCursor){
+              drawMenuItem(PH_CAL_ITEMS, lastPhCalCursor, false);
+              drawMenuItem(PH_CAL_ITEMS, phCalCursor, true);
+              lastPhCalCursor = phCalCursor;
+              drawToastOverlay();
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
+          case UIState::WIFI_MGR:
+            if (forceRedraw){
+              drawMenu("WiFi Manager", WIFI_MGR_ITEMS, WIFI_MGR_COUNT, 0);
+            } else if (toastChanged) {
+              drawToastOverlay();
+            }
+            break;
         }
       }
     }
@@ -1147,6 +1368,26 @@ void TaskUI(void* param){
       lastToastMsg[sizeof(lastToastMsg)-1] = '\0';
     }
 
+    // ===== LED indicator =====
+    const uint32_t nowLed = millis();
+    if (ledFlashUntil > nowLed){
+      ledWrite(ledFlashColor);
+    } else {
+      const bool criticalError = (modbusFailStreak >= 3) || (postErrStreak >= 2);
+      if (criticalError){
+        const bool on = ((nowLed / 200) % 2) == 0;
+        ledWrite(on ? LedRGB{192,0,0} : LedRGB{0,0,0}); // fast red blink
+      } else if (!wifiOK){
+        const bool on = ((nowLed / 1000) % 2) == 0;
+        ledWrite(on ? LedRGB{0,0,192} : LedRGB{0,0,0}); // slow blue blink
+      } else if (wifiOK && !ntpOK){
+        const bool on = ((nowLed / 1000) % 2) == 0;
+        ledWrite(on ? LedRGB{192,192,0} : LedRGB{0,0,0}); // slow yellow blink
+      } else {
+        ledWrite({0,192,0}); // solid green
+      }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
@@ -1156,7 +1397,7 @@ void TaskUI(void* param){
 // =======================
 void TaskSensors(void* param){
   auto* args = static_cast<TaskSensorArgs*>(param);
-  if (!args || !args->qDisplay || !args->qTelemetry || !args->qCalib || !args->rs485 || !args->mode || !args->status || !args->ds || !args->flags){
+  if (!args || !args->qDisplay || !args->qTelemetry || !args->qCalib || !args->rs485 || !args->status || !args->ds || !args->flags){
     vTaskDelete(NULL);
     return;
   }
@@ -1226,8 +1467,6 @@ void TaskSensors(void* param){
     cur.ntpOK  = (flags & EG_TIME_OK);
     strncpy(cur.postStatus, args->status->postStatus, sizeof(cur.postStatus)-1);
     cur.postStatus[sizeof(cur.postStatus)-1] = '\0';
-    cur.mode = *(args->mode);   // hanya indikator di UI
-
     // 5) Kirim snapshot ke UI & HTTP
     xQueueOverwrite(args->qDisplay, &cur);
     xQueueOverwrite(args->qTelemetry, &cur);
@@ -1440,6 +1679,8 @@ void setup(){
   Serial.begin(115200);
   delay(100);
 
+  ledInit();
+
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin();
   tft.setRotation(TFT_ROTATION);
@@ -1471,14 +1712,11 @@ void setup(){
   gUIArgs.qDisplay = qDisplay;
   gUIArgs.qCalib   = qCalib;
   gUIArgs.flags    = egFlags;
-  gUIArgs.mode     = &gMode;
-
   gSensorArgs.qDisplay   = qDisplay;
   gSensorArgs.qTelemetry = qTelemetry;
   gSensorArgs.qCalib     = qCalib;
   gSensorArgs.rs485      = mRS485;
   gSensorArgs.flags      = egFlags;
-  gSensorArgs.mode       = &gMode;
   gSensorArgs.status     = &gStatus;
   gSensorArgs.ds         = &dsAsync;
 

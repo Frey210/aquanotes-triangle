@@ -1,6 +1,6 @@
 # Aquanotes Triangle (ESP32-S3)
 
-UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), DO (S-RJY-01) dan suhu DS18B20, lalu menampilkan ke TFT serta mengirim telemetry ke server HTTP.
+UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), DO (S-RJY-01) dan suhu DS18B20, lalu menampilkan ke TFT serta mengirim telemetry ke server HTTP. Firmware juga menyediakan indikator RGB LED (common cathode) untuk status runtime.
 
 ## Build & Flash (PlatformIO)
 - Prasyarat: PlatformIO CLI atau VSCode + PlatformIO.
@@ -17,8 +17,6 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
   - Dashboard: kembali ke layar utama.
   - WiFi Manager: mulai portal WiFi (captive portal) untuk konfigurasi SSID/password.
   - Kalibrasi Sensor: masuk submenu kalibrasi.
-  - Sensor Mode: hanya indikator mode (PH/EC/NH4) di UI.
-- Sensor Mode: pilih PH/EC/NH4, OK untuk set mode lalu kembali ke dashboard.
 - WiFi Manager: OK untuk menyalakan portal WiFi.
 - Kalibrasi:
   - Cal EC (Auto): pilih 1413 uS/cm atau 12880 uS/cm, OK untuk kirim perintah kalibrasi (Modbus).
@@ -53,6 +51,22 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 ### Battery Sense (SEN-0052)
 - BAT_ADC_PIN: GPIO1 (analog)
 
+### RGB LED (DSP-0031, common cathode)
+- LED_R: GPIO2 (PWM)
+- LED_G: GPIO3 (PWM)
+- LED_B: GPIO4 (PWM)
+- Cathode: GND
+- Resistor: 220–330Ω per channel
+
+## Indikator LED (RGB)
+- Hijau solid: sistem normal (WiFi OK + NTP OK + Modbus OK).
+- Biru blink lambat: WiFi belum terhubung / sedang konek.
+- Kuning blink lambat: WiFi OK tapi NTP belum sync.
+- Merah blink cepat: error kritis (Modbus gagal berulang atau POST error berulang).
+- Cyan flash: POST sukses.
+- Magenta flash: kalibrasi sukses (Cal OK).
+- Merah flash: kalibrasi gagal (Cal Fail).
+
 ## Telemetry HTTP
 - Endpoint: `https://aeraseaku.inkubasistartupunhas.id/sensor/`
 - Payload: JSON berisi UID, suhu, pH, DO, TDS, NH4, salinitas, timestamp.
@@ -84,6 +98,7 @@ graph LR
   MCU --- Buttons[UP/DOWN/OK/BACK]
   MCU --- DS18B20
   MCU --- RS485
+  MCU --- RGBLED[RGB LED]
   RS485 --- PH[pH S-PH-01]
   RS485 --- EC[EC/TDS S-EC-01]
   RS485 --- NH4[NH4 RS485]
