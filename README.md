@@ -1,6 +1,18 @@
 # Aquanotes Triangle (ESP32-S3)
 
-UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), DO (S-RJY-01) dan suhu DS18B20, lalu menampilkan ke TFT serta mengirim telemetry ke server HTTP. Firmware juga menyediakan indikator RGB LED (common cathode) untuk status runtime.
+UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240. Proyek ini membaca sensor pH (S-PH-01), EC/TDS/Salinitas (S-EC-01), NH4 (RS485), dan DO (S-RJY-01), lalu menampilkan data ke TFT serta mengirim telemetry ke server HTTP. Firmware juga menyediakan indikator RGB LED, kontrol backlight, dan status runtime untuk koneksi WiFi/NTP/HTTP.
+
+## Perubahan Terbaru
+- Pembacaan sensor pH diubah mengikuti pola sensor DO: `function 0x03`, start address `0x0000`, panjang `0x0006`, parse `float32 big-endian`.
+- Pembacaan sensor EC/TDS/Salinitas diubah mengikuti pola sensor DO: `function 0x03`, start address `0x0000`, panjang `0x000A`, parse `float32 big-endian`.
+- `Slave ID` sensor tetap mengikuti konfigurasi firmware saat ini:
+  - pH: `12`
+  - EC/TDS/Sal: `30`
+  - NH4: `1`
+  - DO: `55`
+- Nilai dashboard dipendekkan agar fokus ke angka, lalu ukuran font diperkecil otomatis bila teks terlalu lebar.
+- Area box sensor sekarang dibersihkan setiap redraw sehingga angka baru tidak menimpa label atau sisa frame sebelumnya.
+- Suhu utama dashboard di-resolve dari suhu internal sensor modular yang valid (`pH`, `EC`, `NH4`, lalu `DO` sebagai fallback berurutan).
 
 ## Build & Flash (PlatformIO)
 - Prasyarat: PlatformIO CLI atau VSCode + PlatformIO.
@@ -11,7 +23,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
   pio device monitor -b 115200
   ```
 
-## Navigasi UI (OLED + 4 Tombol)
+## Navigasi UI (TFT + 4 Tombol)
 - OK dari dashboard: buka main menu. BACK: kembali ke dashboard.
 - Main menu:
   - Dashboard: kembali ke layar utama.
@@ -21,7 +33,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 - Kalibrasi:
   - Cal EC (Auto): pilih 1413 uS/cm atau 12880 uS/cm, OK untuk kirim perintah kalibrasi (Modbus).
   - Cal NH4: (placeholder, belum diimplementasi pada firmware ini).
-  - Cal DO: Temp from DS (kirim suhu DS18B20), Zero, Slope.
+  - Cal DO: Temp from Sensor, Zero, Slope.
   - Cal pH (S-PH-01): pH 4.01 / 7.00 / 10.01 atau pengaturan kompensasi suhu (External/Off/Onboard).
   - BACK di submenu manapun: kembali ke dashboard.
 
@@ -33,6 +45,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 - TFT_MOSI: GPIO11
 - TFT_MISO: GPIO13 (opsional, biasanya tidak dipakai oleh ILI9341)
 - TFT_SCK: GPIO12
+- TFT_BL: GPIO21
 
 ### Tombol (aktif LOW, INPUT_PULLUP)
 - BTN_UP: GPIO5
@@ -44,9 +57,6 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 - RS485_RX: GPIO16
 - RS485_TX: GPIO15
 - RS485_DE/RE: GPIO14
-
-### DS18B20
-- DATA: GPIO18
 
 ### Battery Sense (SEN-0052)
 - BAT_ADC_PIN: GPIO1 (analog)
@@ -71,6 +81,26 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 - Endpoint: `https://aeraseaku.inkubasistartupunhas.id/sensor/`
 - Payload: JSON berisi UID, suhu, pH, DO, TDS, NH4, salinitas, timestamp.
 - Interval: 10 s (konfigurasi `POST_INTERVAL_MS`).
+
+## Modbus Ringkas
+### pH S-PH-01
+- Slave ID firmware: `12`
+- Read realtime: `0x03`, start `0x0000`, count `6`
+- Format data: `[pH][internal][temperature]` sebagai `float32 big-endian`
+
+### EC S-EC-01
+- Slave ID firmware: `30`
+- Read realtime: `0x03`, start `0x0000`, count `10`
+- Format data: `[EC][internal][temperature][TDS][salinity]` sebagai `float32 big-endian`
+
+### NH4
+- Slave ID firmware: `1`
+- Tetap dibaca via register holding sesuai implementasi saat ini
+
+### DO S-RJY-01
+- Slave ID firmware: `55`
+- Read realtime: `0x03`, start `0x0000`, count `6`
+- Format data: `[DO][saturation][temperature]` sebagai `float32 big-endian`
 
 ## Galeri
 - Tambahkan path gambar di sini (mis. `assets/foto-rakit.jpg`).

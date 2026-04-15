@@ -9,8 +9,6 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
 #include <ModbusMaster.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -26,7 +24,8 @@
 // =======================
 
 // TFT ILI9341 (SPI) - landscape
-static const uint8_t TFT_ROTATION = 1;
+static const uint8_t TFT_ROTATION = 3;
+static const uint32_t TFT_SPI_FREQ = 16000000;
 
 // TFT pin mapping (ESP32-S3)
 #define TFT_CS   10   // Chip Select
@@ -35,6 +34,8 @@ static const uint8_t TFT_ROTATION = 1;
 #define TFT_MOSI 11
 #define TFT_MISO 13
 #define TFT_SCK  12
+#define TFT_BL   21   // Backlight control via 2N2222 transistor
+#define TFT_BACKLIGHT_ON HIGH
 
 // 16-bit color aliases (RGB565)
 #define TFT_BLACK     0x0000
@@ -48,9 +49,6 @@ static const uint8_t TFT_ROTATION = 1;
 #define TFT_GREEN     0x07E0
 #define TFT_BLUE      0x001F
 #define TFT_MAGENTA   0xF81F
-
-// DS18B20
-#define DS18B20_PIN 18
 
 // RGB LED (common cathode)
 #define LED_R_PIN 2
@@ -69,8 +67,7 @@ static const uint8_t TFT_ROTATION = 1;
 #define RS485_TX_PIN    15
 #define RS485_DE_RE_PIN 14
 
-// Slave IDs (pH/EC/NH4 sekarang unik, DO tetap 55)
-#define RK_SLAVE_ID   0x06   // RK500-09 multi-parameter (default Modbus addr 06H)
+// Slave IDs modular
 #define PH_SLAVE_ID   12   // pH
 #define EC_SLAVE_ID   30   // EC/TDS/Sal
 #define NH4_SLAVE_ID  1   // NH4
@@ -84,10 +81,11 @@ static const uint8_t TFT_ROTATION = 1;
 
 // Server & Identitas
 const char* POST_URL   = "https://aeraseaku.inkubasistartupunhas.id/sensor/";
-const char* UID        = "AER2023AQ0020";
+const char* UID        = "AER2023AQ0019";
 const char* FW_VERSION = "v1.3.0-RTOS-BTN4";
 const uint32_t POST_INTERVAL_MS = 10000; // 10 detik
 const uint32_t HTTP_TIMEOUT_MS  = 3500;
+const uint32_t BACKLIGHT_TIMEOUT_MS = 15000; // mati setelah 15 detik tanpa interaksi
 
 // WiFi Manager & NTP
 // Beberapa server NTP untuk fallback
@@ -144,52 +142,13 @@ public:
 };
 
 TFTWrapper tft(TFT_CS, TFT_DC, TFT_RST);
-
-OneWire oneWire(DS18B20_PIN);
-DallasTemperature ds18b20(&oneWire);
 HardwareSerial RS485(2);
-
-// Multi-parameter sensor RK500-09
-ModbusMaster mb_rk;
 
 // (opsional) legacy objects untuk menu kalibrasi lama
 ModbusMaster mb_ph, mb_ec, mb_nh4, mb_do;
 
 struct RuntimeStatus {
   char postStatus[16] = "---";
-};
-
-struct AsyncDS18B20 {
-  explicit AsyncDS18B20(DallasTemperature& sensor) : sensor(sensor) {}
-
-  void begin(){
-    sensor.begin();
-    sensor.setResolution(12);
-    sensor.setWaitForConversion(false); // non-blocking conversion
-    lastRequestMs = 0;
-  }
-
-  void tick(){
-    uint32_t now = millis();
-    if (!busy && now - lastRequestMs >= 1000){
-      sensor.requestTemperatures();
-      busy = true;
-      lastRequestMs = now;
-    }
-
-    if (busy && sensor.isConversionComplete()){
-      lastTemp = sensor.getTempCByIndex(0);
-      busy = false;
-    }
-  }
-
-  float temperatureC() const { return lastTemp; }
-
-private:
-  DallasTemperature& sensor;
-  uint32_t lastRequestMs = 0;
-  bool busy = false;
-  float lastTemp = NAN;
 };
 
 struct TaskInputArgs {
@@ -210,7 +169,6 @@ struct TaskSensorArgs {
   SemaphoreHandle_t rs485;
   EventGroupHandle_t flags;
   RuntimeStatus* status;
-  AsyncDS18B20* ds;
 };
 
 struct TaskHTTPArgs {
@@ -222,6 +180,7 @@ struct TaskHTTPArgs {
 // Helper RS485
 static inline void rs485Receive()  { digitalWrite(RS485_DE_RE_PIN, LOW); }
 static inline void rs485Transmit() { digitalWrite(RS485_DE_RE_PIN, HIGH); }
+static void modbusIdle() { vTaskDelay(pdMS_TO_TICKS(1)); }
 
 // =======================
 //  RTOS PRIMITIVES
@@ -237,6 +196,7 @@ EventGroupHandle_t egFlags;
 #define EG_WIFI_OK   (1<<0)
 #define EG_TIME_OK   (1<<1)
 #define EG_PORTAL_ON (1<<2)
+#define EG_WIFI_BUSY (1<<3)
 
 // Input event
 enum InputType: uint8_t { ENC_DELTA, BTN_PRESS };
@@ -272,7 +232,8 @@ static const uint16_t REG_DO_SLOPE      = 0x1003; // write 0
 //  GLOBAL STATUS
 // =======================
 RuntimeStatus gStatus;
-AsyncDS18B20 dsAsync(ds18b20);
+volatile uint32_t gLastInteractionMs = 0;
+volatile bool gBacklightOn = true;
 
 // Battery sensor (SEN-0052)
 #define BAT_ADC_PIN 1
@@ -453,37 +414,72 @@ static bool readBattery(float& vbat, float& pct){
 }
 
 float regsToFloatBE(uint16_t r0, uint16_t r1){
-  uint8_t b[4] = { uint8_t(r0>>8), uint8_t(r0&0xFF), uint8_t(r1>>8), uint8_t(r1&0xFF) };
+  uint32_t raw = (static_cast<uint32_t>(r0) << 16) | static_cast<uint32_t>(r1);
   float f;
-  memcpy(&f, b, sizeof(f));
+  memcpy(&f, &raw, sizeof(f));
   return f;
 }
 
 bool readPH(float& t, float& ph){
-  uint8_t res = mb_ph.readInputRegisters(0x0001, 2);
+  // Sensor pH Rika memakai function 0x03, start 0x0000, length 0x0006.
+  // Format respons: [pH][internal][temperature], semuanya float32 big-endian.
+  uint8_t res = mb_ph.readHoldingRegisters(0x0000, 6);
   if (res == mb_ph.ku8MBSuccess){
-    uint16_t rawPh = mb_ph.getResponseBuffer(0);
-    uint16_t rawT  = mb_ph.getResponseBuffer(1);
-    ph = rawPh / 100.0f;
-    t  = rawT  / 100.0f;
+    ph = regsToFloatBE(mb_ph.getResponseBuffer(0), mb_ph.getResponseBuffer(1));
+    t  = regsToFloatBE(mb_ph.getResponseBuffer(4), mb_ph.getResponseBuffer(5));
+
+    if (!isfinite(ph) || !isfinite(t) || ph < 0.0f || ph > 14.5f || t < -20.0f || t > 80.0f){
+#if DEBUG_MODBUS
+      Serial.println("[PH] Invalid float payload");
+#endif
+      return false;
+    }
+
+#if DEBUG_MODBUS
+    Serial.print("[PH] pH="); Serial.print(ph);
+    Serial.print(", T=");     Serial.println(t);
+#endif
     return true;
   }
+
+#if DEBUG_MODBUS
+  Serial.print("[PH] Modbus error: 0x");
+  Serial.println(res, HEX);
+#endif
   return false;
 }
 
 bool readEC(float& t, float& ec, float& tds, float& sal){
-  uint8_t res = mb_ec.readInputRegisters(0x0001, 4);
+  // Sensor EC Rika memakai function 0x03, start 0x0000, length 0x000A.
+  // Format respons: [EC][internal][temperature][TDS][salinity], float32 big-endian.
+  uint8_t res = mb_ec.readHoldingRegisters(0x0000, 10);
   if (res == mb_ec.ku8MBSuccess){
-    uint16_t rawT   = mb_ec.getResponseBuffer(0);
-    uint16_t rawEC  = mb_ec.getResponseBuffer(1);
-    uint16_t rawTDS = mb_ec.getResponseBuffer(2);
-    uint16_t rawSal = mb_ec.getResponseBuffer(3);
-    t   = rawT;
-    ec  = rawEC;
-    tds = rawTDS;
-    sal = rawSal;
+    ec  = regsToFloatBE(mb_ec.getResponseBuffer(0), mb_ec.getResponseBuffer(1));
+    t   = regsToFloatBE(mb_ec.getResponseBuffer(4), mb_ec.getResponseBuffer(5));
+    tds = regsToFloatBE(mb_ec.getResponseBuffer(6), mb_ec.getResponseBuffer(7));
+    sal = regsToFloatBE(mb_ec.getResponseBuffer(8), mb_ec.getResponseBuffer(9));
+
+    if (!isfinite(ec) || !isfinite(t) || !isfinite(tds) || !isfinite(sal) ||
+        ec < 0.0f || tds < 0.0f || sal < 0.0f || t < -20.0f || t > 80.0f){
+#if DEBUG_MODBUS
+      Serial.println("[EC] Invalid float payload");
+#endif
+      return false;
+    }
+
+#if DEBUG_MODBUS
+    Serial.print("[EC] EC=");        Serial.print(ec);
+    Serial.print(" uS/cm, T=");      Serial.print(t);
+    Serial.print(" C, TDS=");        Serial.print(tds);
+    Serial.print(" mg/L, Sal=");     Serial.println(sal);
+#endif
     return true;
   }
+
+#if DEBUG_MODBUS
+  Serial.print("[EC] Modbus error: 0x");
+  Serial.println(res, HEX);
+#endif
   return false;
 }
 
@@ -527,26 +523,27 @@ bool readNH4(float& nh4, float& t){
 }
 
 bool readDO(float& do_mg, float& tC){
-  uint8_t res = mb_do.readHoldingRegisters(0x0000, 4);
+  // Sensor DO Rika memakai function 0x03, start 0x0000, length 0x0006.
+  // Format respons: 3 float 32-bit big-endian
+  // [DO mg/L][Saturation %][Temperature C]
+  uint8_t res = mb_do.readHoldingRegisters(0x0000, 6);
   if (res == mb_do.ku8MBSuccess){
-    uint16_t rawVal    = mb_do.getResponseBuffer(0);
-    uint16_t rawDecVal = mb_do.getResponseBuffer(1);
-    uint16_t rawTemp   = mb_do.getResponseBuffer(2);
-    uint16_t rawDecT   = mb_do.getResponseBuffer(3);
+    do_mg = regsToFloatBE(mb_do.getResponseBuffer(0), mb_do.getResponseBuffer(1));
+    float sat = regsToFloatBE(mb_do.getResponseBuffer(2), mb_do.getResponseBuffer(3));
+    tC    = regsToFloatBE(mb_do.getResponseBuffer(4), mb_do.getResponseBuffer(5));
 
-    float scaleVal = pow10u(rawDecVal);
-    float scaleT   = pow10u(rawDecT);
-
-    do_mg = rawVal  / (scaleVal > 0 ? scaleVal : 1.0f);
-    tC    = rawTemp / (scaleT   > 0 ? scaleT   : 1.0f);
+    if (!isfinite(do_mg) || !isfinite(tC) || do_mg < 0.0f || tC < -20.0f || tC > 80.0f){
+#if DEBUG_MODBUS
+      Serial.println("[DO] Invalid float payload");
+#endif
+      return false;
+    }
 
 #if DEBUG_MODBUS
-    Serial.print("[DO] rawVal=");    Serial.print(rawVal);
-    Serial.print(" decVal=");        Serial.print(rawDecVal);
-    Serial.print(" rawTemp=");       Serial.print(rawTemp);
-    Serial.print(" decTemp=");       Serial.println(rawDecT);
     Serial.print("[DO] DO=");        Serial.print(do_mg);
-    Serial.print(" mg/L, T=");       Serial.println(tC);
+    Serial.print(" mg/L, Sat=");     Serial.print(sat);
+    Serial.print(" %, T=");
+    Serial.println(tC);
 #endif
     return true;
   } else {
@@ -558,78 +555,61 @@ bool readDO(float& do_mg, float& tC){
   }
 }
 
-// =======================
-//  PEMBACAAN RK500-09 MULTI SENSOR
-// =======================
-//
-// Mapping index register dari manual RK500-09:
-// idx 0:  Temp value,  idx 1: Temp dec
-// idx 6:  EC value,    idx 7: EC dec
-// idx 8:  pH value,    idx 9: pH dec
-// idx 12: DO value,    idx 13: DO dec
-// idx 14: NH4 value,   idx 15: NH4 dec
-// idx 34: Sal value,   idx 35: Sal dec
-// idx 36: TDS value,   idx 37: TDS dec
-//
-// Nilai akhir = value / (10^dec)
-//
+static void resolveWaterTemperature(DisplayData& cur){
+  if (cur.ph_ok && !isnan(cur.phT)) {
+    cur.t_ds = cur.phT;
+  } else if (cur.ec_ok && !isnan(cur.ecT)) {
+    cur.t_ds = cur.ecT;
+  } else if (cur.nh4_ok && !isnan(cur.nh4T)) {
+    cur.t_ds = cur.nh4T;
+  } else if (cur.do_ok && !isnan(cur.do_tC)) {
+    cur.t_ds = cur.do_tC;
+  } else {
+    cur.t_ds = NAN;
+  }
+}
 
-static bool readRK50009(DisplayData& cur) {
-  // Baca 0x002A (42) register mulai address 0
-  uint8_t res = mb_rk.readHoldingRegisters(0x0000, 0x002A);
-  if (res != mb_rk.ku8MBSuccess) {
-    // kalau gagal, tandai semua parameter dari RK500-09 sebagai invalid
-    cur.ph_ok  = false;
-    cur.ec_ok  = false;
-    cur.do_ok  = false;
-    cur.nh4_ok = false;
-    return false;
+static void readOneModularSensor(DisplayData& cur, uint8_t& phase){
+  float temp = NAN;
+  float value1 = NAN;
+  float value2 = NAN;
+  float value3 = NAN;
+
+  switch (phase){
+    case 0:
+      if (readPH(temp, value1)){
+        cur.ph = value1;
+        cur.phT = temp;
+        cur.ph_ok = true;
+      }
+      break;
+    case 1:
+      if (readEC(temp, value1, value2, value3)){
+        cur.ec = value1;
+        cur.tds = value2;
+        cur.sal = value3;
+        cur.ecT = temp;
+        cur.ec_ok = true;
+      }
+      break;
+    case 2:
+      if (readNH4(value1, temp)){
+        cur.nh4 = value1;
+        cur.nh4T = temp;
+        cur.nh4_ok = true;
+      }
+      break;
+    case 3:
+    default:
+      if (readDO(value1, temp)){
+        cur.do_mgL = value1;
+        cur.do_tC = temp;
+        cur.do_ok = true;
+      }
+      break;
   }
 
-  auto val_dec = [&](uint16_t idxVal, uint16_t idxDec) -> float {
-    uint16_t rawVal = mb_rk.getResponseBuffer(idxVal);
-    uint16_t rawDec = mb_rk.getResponseBuffer(idxDec);
-    float scale = pow10u(rawDec);
-    return rawVal / (scale > 0.0f ? scale : 1.0f);
-  };
-
-  // === SUHU INTERNAL RK500-09 ===
-  float t_rk  = val_dec(0, 1);   // <-- suhu dari RK500-09 (INI YANG AKAN KITA PAKAI)
-
-  // Parameter utama
-  float ec    = val_dec(6, 7);    // uS/cm
-  float ph    = val_dec(8, 9);    // pH
-  float do_mg = val_dec(12, 13);  // mg/L
-  float nh4   = val_dec(14, 15);  // mg/L
-  float sal   = val_dec(34, 35);  // PSU
-  float tds   = val_dec(36, 37);  // mg/L
-
-  // ===== MASUKKAN KE DisplayData =====
-
-  // 1) SUHU UTAMA ALAT
-  //    t_ds sekarang DIISI dari RK500-09, bukan dari DS18B20
-  cur.t_ds   = t_rk;
-
-  // 2) Parameter lain
-  cur.ec     = ec;
-  cur.ph     = ph;
-  cur.do_mgL = do_mg;
-  cur.nh4    = nh4;
-  cur.sal    = sal;
-  cur.tds    = tds;
-
-  // 3) Simpan juga sebagai suhu internal sensor-sensor (kalau mau dipakai di kalibrasi)
-  cur.phT    = t_rk;
-  cur.ecT    = t_rk;
-  cur.do_tC  = t_rk;
-  cur.nh4T   = t_rk;
-
-  cur.ph_ok  = true;
-  cur.ec_ok  = true;
-  cur.do_ok  = true;
-  cur.nh4_ok = true;
-
-  return true;
+  phase = static_cast<uint8_t>((phase + 1) % 4);
 }
 
 
@@ -742,7 +722,7 @@ const char* NH4_CAL_ITEMS[] = {
 const int NH4_CAL_COUNT = sizeof(NH4_CAL_ITEMS)/sizeof(NH4_CAL_ITEMS[0]);
 
 const char* DO_CAL_ITEMS[] = {
-  "Temp from DS18B20",
+  "Temp from Sensor",
   "Zero",
   "Slope",
   "Back"
@@ -779,19 +759,20 @@ struct DashboardCache {
 };
 
 static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
-  snprintf(out.temp, sizeof(out.temp), "%.2f C", d.t_ds);
-  if (d.do_ok)  snprintf(out.do_mg, sizeof(out.do_mg), "%.2f mg/L", d.do_mgL);
+  if (isfinite(d.t_ds)) snprintf(out.temp, sizeof(out.temp), "%.2f", d.t_ds);
+  else                  snprintf(out.temp, sizeof(out.temp), "--");
+  if (d.do_ok)  snprintf(out.do_mg, sizeof(out.do_mg), "%.2f", d.do_mgL);
   else          snprintf(out.do_mg, sizeof(out.do_mg), "--");
   if (d.ph_ok)  snprintf(out.ph, sizeof(out.ph), "%.2f", d.ph);
   else          snprintf(out.ph, sizeof(out.ph), "--");
-  if (d.nh4_ok) snprintf(out.nh4, sizeof(out.nh4), "%.2f mg/L", d.nh4);
+  if (d.nh4_ok) snprintf(out.nh4, sizeof(out.nh4), "%.2f", d.nh4);
   else          snprintf(out.nh4, sizeof(out.nh4), "--");
-  if (d.ec_ok)  snprintf(out.ec, sizeof(out.ec), "%.0f uS/cm", d.ec);
+  if (d.ec_ok)  snprintf(out.ec, sizeof(out.ec), "%.0f", d.ec);
   else          snprintf(out.ec, sizeof(out.ec), "--");
-  if (d.ec_ok)  snprintf(out.tds, sizeof(out.tds), "%.0f mg/L", d.tds);
+  if (d.ec_ok)  snprintf(out.tds, sizeof(out.tds), "%.0f", d.tds);
   else          snprintf(out.tds, sizeof(out.tds), "--");
 
-  snprintf(out.statusLeft, sizeof(out.statusLeft), "WiFi:%s NTP:%s POST:%s",
+  snprintf(out.statusLeft, sizeof(out.statusLeft), "WiFi:%s NTP:%s P:%s",
            d.wifiOK ? "OK" : "--",
            d.ntpOK  ? "OK" : "--",
            d.postStatus);
@@ -814,29 +795,62 @@ static void drawToastOverlay(){
 }
 
 static void drawStatusBar(const DisplayData& d){
+  const int statusLeftX = 6;
+  const int statusLeftW = 210;
+  const int statusRightX = 220;
+  const int statusRightW = 94;
+
   tft.fillRect(0, 0, 320, 24, TFT_DARKGREY);
   tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
   tft.setTextFont(2);
 
   DashboardCache tmp{};
   formatDashboardStrings(d, tmp);
-  tft.drawString(tmp.statusLeft, 6, 4);
+  tft.fillRect(statusLeftX, 0, statusLeftW, 24, TFT_DARKGREY);
+  tft.drawString(tmp.statusLeft, statusLeftX, 4);
 
   int16_t w = tft.textWidth(tmp.statusRight, 2);
+  tft.fillRect(statusRightX, 0, statusRightW, 24, TFT_NAVY);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
   tft.drawString(tmp.statusRight, 316 - w, 4);
 }
 
 static void drawMetricBox(int x, int y, int w, int h, const char* label, const char* value, uint16_t color){
+  tft.fillRect(x, y, w, h, TFT_BLACK);
   tft.drawRect(x, y, w, h, TFT_DARKGREY);
   tft.setTextFont(2);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   tft.drawString(label, x + 6, y + 4);
-  tft.setTextFont(4);
+
+  uint8_t valueFont = 4;
+  const int maxTextW = w - 12;
+  while (valueFont > 2 && tft.textWidth(value, valueFont) > maxTextW){
+    --valueFont;
+  }
+
+  int16_t valueW = tft.textWidth(value, valueFont);
+  int16_t valueX = x + 6;
+  if (valueW < maxTextW){
+    valueX = x + (w - valueW) / 2;
+  }
+
+  const int valueY = (valueFont >= 4) ? (y + 24) : (y + 28);
+  tft.setTextFont(valueFont);
   tft.setTextColor(color, TFT_BLACK);
-  tft.drawString(value, x + 6, y + 24);
+  tft.drawString(value, valueX, valueY);
 }
 
-void drawSplashFrame(uint8_t pct, bool wifiOK, bool ntpOK){
+static void drawWiFiBusyScreen(const char* line1, const char* line2){
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("WiFi", 160, 72, 4);
+  tft.setTextFont(2);
+  tft.drawCentreString(line1, 160, 120, 2);
+  tft.drawCentreString(line2, 160, 144, 2);
+}
+
+static void drawSplashStatic(){
   const uint16_t splashBg = tft.color565(0x19, 0x8A, 0xFF);
   tft.fillScreen(splashBg);
 
@@ -856,11 +870,19 @@ void drawSplashFrame(uint8_t pct, bool wifiOK, bool ntpOK){
   tft.drawCentreString(ln1, 160, 115, 2);
   tft.drawCentreString(ln2, 160, 135, 2);
 
+  tft.drawRect(40, 190, 240, 14, TFT_WHITE);
+}
+
+static void drawSplashDynamic(uint8_t pct, bool wifiOK, bool ntpOK){
+  const uint16_t splashBg = tft.color565(0x19, 0x8A, 0xFF);
+
+  tft.fillRect(60, 158, 100, 16, splashBg);
+  tft.fillRect(160, 158, 100, 16, splashBg);
   tft.setTextColor(TFT_WHITE, splashBg);
   tft.drawCentreString(wifiOK ? "WiFi: OK" : "WiFi: --", 110, 158, 2);
   tft.drawCentreString(ntpOK  ? "NTP: OK"  : "NTP: --", 210, 158, 2);
 
-  tft.drawRect(40, 190, 240, 14, TFT_WHITE);
+  tft.fillRect(42, 192, 236, 10, splashBg);
   tft.fillRect(42, 192, map(pct, 0, 100, 0, 236), 10, TFT_WHITE);
 }
 
@@ -873,12 +895,13 @@ static void drawDashboardFrame(const DisplayData& d){
   const int rowH = 60;
   const int y0 = 28;
 
-  char buf[24];
+  char buf[16];
 
-  snprintf(buf, sizeof(buf), "%.2f C", d.t_ds);
+  if (isfinite(d.t_ds)) snprintf(buf, sizeof(buf), "%.2f", d.t_ds);
+  else                  snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap, y0, colW, rowH, "Temperature", buf, TFT_YELLOW);
 
-  if (d.do_ok) snprintf(buf, sizeof(buf), "%.2f mg/L", d.do_mgL);
+  if (d.do_ok) snprintf(buf, sizeof(buf), "%.2f", d.do_mgL);
   else         snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap * 2 + colW, y0, colW, rowH, "Dissolved O2", buf, TFT_CYAN);
 
@@ -886,15 +909,15 @@ static void drawDashboardFrame(const DisplayData& d){
   else         snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", buf, TFT_GREEN);
 
-  if (d.nh4_ok) snprintf(buf, sizeof(buf), "%.2f mg/L", d.nh4);
+  if (d.nh4_ok) snprintf(buf, sizeof(buf), "%.2f", d.nh4);
   else          snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "NH4", buf, TFT_ORANGE);
 
-  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f uS/cm", d.ec);
+  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f", d.ec);
   else         snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", buf, TFT_BLUE);
 
-  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f mg/L", d.tds);
+  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f", d.tds);
   else         snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", buf, TFT_MAGENTA);
 
@@ -982,19 +1005,57 @@ struct LedRGB {
 };
 
 static inline void ledWrite(const LedRGB& c){
-  ledcWrite(LEDC_CH_R, c.r);
-  ledcWrite(LEDC_CH_G, c.g);
-  ledcWrite(LEDC_CH_B, c.b);
+  digitalWrite(LED_R_PIN, c.r ? HIGH : LOW);
+  digitalWrite(LED_G_PIN, c.g ? HIGH : LOW);
+  digitalWrite(LED_B_PIN, c.b ? HIGH : LOW);
 }
 
 static void ledInit(){
-  ledcSetup(LEDC_CH_R, LEDC_FREQ, LEDC_RES);
-  ledcSetup(LEDC_CH_G, LEDC_FREQ, LEDC_RES);
-  ledcSetup(LEDC_CH_B, LEDC_FREQ, LEDC_RES);
-  ledcAttachPin(LED_R_PIN, LEDC_CH_R);
-  ledcAttachPin(LED_G_PIN, LEDC_CH_G);
-  ledcAttachPin(LED_B_PIN, LEDC_CH_B);
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
   ledWrite({0,0,0});
+}
+
+static void setBacklight(bool on){
+  gBacklightOn = on;
+#if TFT_BACKLIGHT_ON == HIGH
+  digitalWrite(TFT_BL, on ? HIGH : LOW);
+#else
+  digitalWrite(TFT_BL, on ? LOW : HIGH);
+#endif
+}
+
+static void noteInteraction(){
+  gLastInteractionMs = millis();
+  if (!gBacklightOn){
+    setBacklight(true);
+  }
+}
+
+static void initDisplay(){
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+  pinMode(TFT_DC, OUTPUT);
+  digitalWrite(TFT_DC, HIGH);
+  pinMode(TFT_RST, OUTPUT);
+
+  // Beberapa modul ILI9341 di ESP32-S3 lebih stabil jika di-hard-reset
+  // dulu dan dijalankan dengan clock SPI yang lebih konservatif.
+  digitalWrite(TFT_RST, HIGH);
+  delay(5);
+  digitalWrite(TFT_RST, LOW);
+  delay(20);
+  digitalWrite(TFT_RST, HIGH);
+  delay(150);
+
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
+  tft.begin(TFT_SPI_FREQ);
+  delay(20);
+  tft.setRotation(TFT_ROTATION);
+  tft.invertDisplay(false);
+  tft.setTextWrap(false);
+  tft.fillScreen(TFT_BLACK);
 }
 
 // =======================
@@ -1015,20 +1076,24 @@ void TaskInput(void* param){
   for(;;){
     // Navigasi: UP / DOWN → ENC_DELTA (-1 / +1)
     if (debounceRead(BTN_UP)){
+      noteInteraction();
       InputEvent e{ENC_DELTA, -1};
       xQueueSend(args->qInput, &e, 0);
     }
     if (debounceRead(BTN_DOWN)){
+      noteInteraction();
       InputEvent e{ENC_DELTA, +1};
       xQueueSend(args->qInput, &e, 0);
     }
 
     // Aksi: OK & BACK → BTN_PRESS
     if (debounceRead(BTN_OK)){
+      noteInteraction();
       InputEvent e{BTN_PRESS, BTN_OK};
       xQueueSend(args->qInput, &e, 0);
     }
     if (debounceRead(BTN_BACK)){
+      noteInteraction();
       InputEvent e{BTN_PRESS, BTN_BACK};
       xQueueSend(args->qInput, &e, 0);
     }
@@ -1051,10 +1116,13 @@ void TaskUI(void* param){
   DashboardCache dashCache{};
   uint8_t splashPct = 0;
   uint32_t tSplash = millis();
+  bool splashDrawn = false;
+  bool wasInSplash = true;
   UIState ui = UIState::DASHBOARD;
   UIState lastUi = UIState::DASHBOARD;
   bool lastWifiOK = false;
   bool lastNtpOK = false;
+  bool lastWiFiBusy = false;
   bool lastToastActive = false;
   char lastToastMsg[sizeof(toastMsg)] = {0};
   char lastPostStatus[16] = {0};
@@ -1073,6 +1141,10 @@ void TaskUI(void* param){
     bool gotInput = false;
     bool gotDisplay = false;
     bool forceRedraw = false;
+    uint32_t idleMs = millis() - gLastInteractionMs;
+    if (gBacklightOn && idleMs >= BACKLIGHT_TIMEOUT_MS){
+      setBacklight(false);
+    }
 
     InputEvent ev;
     while (xQueueReceive(args->qInput, &ev, 0) == pdTRUE){
@@ -1220,6 +1292,7 @@ void TaskUI(void* param){
     EventBits_t flags = xEventGroupGetBits(args->flags);
     bool wifiOK = (flags & EG_WIFI_OK);
     bool ntpOK  = (flags & EG_TIME_OK);
+    bool wifiBusy = (flags & EG_WIFI_BUSY);
     bool toastNow = toastActive();
     bool toastChanged = (toastNow != lastToastActive) ||
                         (strncmp(toastMsg, lastToastMsg, sizeof(toastMsg)) != 0);
@@ -1240,19 +1313,34 @@ void TaskUI(void* param){
 
     uint32_t now = millis();
     bool inSplash = (now - tSplash < 2000);
-    bool needDraw = gotInput || gotDisplay || toastChanged ||
-                    (wifiOK != lastWifiOK) || (ntpOK != lastNtpOK);
+    if (wasInSplash && !inSplash){
+      forceRedraw = true;
+      dashCache.valid = false;
+      splashDrawn = false;
+    }
+    bool needDraw = forceRedraw || gotInput || gotDisplay || toastChanged ||
+                    (wifiOK != lastWifiOK) || (ntpOK != lastNtpOK) ||
+                    (wifiBusy != lastWiFiBusy);
 
     if (inSplash){
       if (splashPct < 100 && now - tSplash > splashPct*10){
         splashPct++;
         needDraw = true;
       }
+      if (!splashDrawn){
+        drawSplashStatic();
+        splashDrawn = true;
+        needDraw = true;
+      }
       if (needDraw){
-        drawSplashFrame(splashPct, wifiOK, ntpOK);
+        drawSplashDynamic(splashPct, wifiOK, ntpOK);
       }
     } else {
-      if (needDraw){
+      if (wifiBusy){
+        if (needDraw){
+          drawWiFiBusyScreen("Radio aktif", "Tunggu koneksi...");
+        }
+      } else if (needDraw){
         if (ui != lastUi){
           forceRedraw = true;
           lastUi = ui;
@@ -1363,14 +1451,18 @@ void TaskUI(void* param){
     if (needDraw){
       lastWifiOK = wifiOK;
       lastNtpOK = ntpOK;
+      lastWiFiBusy = wifiBusy;
       lastToastActive = toastNow;
       strncpy(lastToastMsg, toastMsg, sizeof(lastToastMsg)-1);
       lastToastMsg[sizeof(lastToastMsg)-1] = '\0';
     }
+    wasInSplash = inSplash;
 
     // ===== LED indicator =====
     const uint32_t nowLed = millis();
-    if (ledFlashUntil > nowLed){
+    if (wifiBusy){
+      ledWrite({0,0,0});
+    } else if (ledFlashUntil > nowLed){
       ledWrite(ledFlashColor);
     } else {
       const bool criticalError = (modbusFailStreak >= 3) || (postErrStreak >= 2);
@@ -1388,7 +1480,7 @@ void TaskUI(void* param){
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(wifiBusy ? 150 : 50));
   }
 }
 
@@ -1397,13 +1489,10 @@ void TaskUI(void* param){
 // =======================
 void TaskSensors(void* param){
   auto* args = static_cast<TaskSensorArgs*>(param);
-  if (!args || !args->qDisplay || !args->qTelemetry || !args->qCalib || !args->rs485 || !args->status || !args->ds || !args->flags){
+  if (!args || !args->qDisplay || !args->qTelemetry || !args->qCalib || !args->rs485 || !args->status || !args->flags){
     vTaskDelete(NULL);
     return;
   }
-
-  AsyncDS18B20& ds = *(args->ds);
-  ds.begin();
 
   pinMode(RS485_DE_RE_PIN, OUTPUT); rs485Receive();
   RS485.begin(9600, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
@@ -1412,21 +1501,28 @@ void TaskSensors(void* param){
     mb.begin(id, RS485);
     mb.preTransmission(rs485Transmit);
     mb.postTransmission(rs485Receive);
+    mb.idle(modbusIdle);
   };
 
-  // Multi-parameter RK500-09 (address 0x06)
-  bindNode(mb_rk, RK_SLAVE_ID);
-
-  // (opsional) legacy node untuk menu kalibrasi lama – tidak dibaca lagi periodik
+  // Node sensor modular
   bindNode(mb_ph,  PH_SLAVE_ID);
   bindNode(mb_ec,  EC_SLAVE_ID);
   bindNode(mb_nh4, NH4_SLAVE_ID);
   bindNode(mb_do,  DO_SLAVE_ID);
 
   DisplayData cur = {};
+  cur.t_ds = NAN;
+  cur.phT = NAN;
+  cur.ecT = NAN;
+  cur.nh4T = NAN;
+  cur.do_tC = NAN;
+  uint8_t modularPhase = 0;
   const TickType_t rsLockTimeout = pdMS_TO_TICKS(100);
 
   for(;;){
+    EventBits_t loopFlags = xEventGroupGetBits(args->flags);
+    bool wifiBusy = (loopFlags & EG_WIFI_BUSY);
+
     // 1) Proses perintah kalibrasi (kalau kamu masih pakai menu lama)
     CalibMsg msg;
     while (xQueueReceive(args->qCalib, &msg, 0) == pdTRUE){
@@ -1436,16 +1532,10 @@ void TaskSensors(void* param){
       }
     }
 
-    // 2) Update suhu DS18B20 (non-blocking)
-    // ds.tick();
-    // float t = ds.temperatureC();
-    // if (!isnan(t)){
-    //   cur.t_ds = t;
-    // }
-
-    // 3) Baca semua parameter dari RK500-09 sekali jalan
+    // 2) Poll sensor modular satu per satu agar bus ringan dan watchdog aman
     if (xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
-      readRK50009(cur);
+      readOneModularSensor(cur, modularPhase);
+      resolveWaterTemperature(cur);
       rs485Receive();
       xSemaphoreGive(args->rs485);
     }
@@ -1472,7 +1562,7 @@ void TaskSensors(void* param){
     xQueueOverwrite(args->qTelemetry, &cur);
 
     // 6) Delay sampling
-    vTaskDelay(pdMS_TO_TICKS(250));   // 4 Hz; silakan sesuaikan
+    vTaskDelay(pdMS_TO_TICKS(wifiBusy ? 1000 : 250));   // 4 Hz normal, diperlambat saat WiFi aktif
   }
 }
 
@@ -1490,14 +1580,16 @@ void TaskHTTP(void* param){
     return;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();   // pakai kredensial terakhir yang tersimpan
+  Serial.println("[BOOT] TaskHTTP start");
+  WiFi.mode(WIFI_OFF);
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(300);
   wm.setConfigPortalBlocking(false);
 
   uint32_t lastPost = 0;
+  uint32_t lastWiFiAttempt = 0;
+  uint32_t bootMs = millis();
   DisplayData snap{};
   bool wifiWasConnected = false;
 
@@ -1536,8 +1628,20 @@ void TaskHTTP(void* param){
       WiFi.mode(WIFI_STA);
     }
 
-    // ====== Monitor status WiFi biasa (tanpa portal) ======
+    // ====== Auto reconnect yang lebih ringan ======
     bool wifiNow = (WiFi.status() == WL_CONNECTED);
+    uint32_t now = millis();
+    if (!wifiNow && (now - bootMs) >= 15000 && (now - lastWiFiAttempt) >= 30000){
+      lastWiFiAttempt = now;
+      Serial.println("[BOOT] WiFi connect attempt");
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(true);
+      WiFi.setTxPower(WIFI_POWER_8_5dBm);
+      WiFi.begin();   // pakai kredensial terakhir yang tersimpan
+    }
+
+    // ====== Monitor status WiFi biasa (tanpa portal) ======
+    wifiNow = (WiFi.status() == WL_CONNECTED);
 
     if (wifiNow && !wifiWasConnected){
       // Baru saja connect
@@ -1678,26 +1782,19 @@ void TaskHTTP(void* param){
 void setup(){
   Serial.begin(115200);
   delay(100);
+  Serial.println("[BOOT] setup begin");
 
   ledInit();
-
-  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
-  tft.begin();
-  tft.setRotation(TFT_ROTATION);
-  tft.invertDisplay(1);
-  tft.setTextWrap(false);
-  tft.fillScreen(TFT_BLACK);
-#ifdef TFT_BL
+  Serial.println("[BOOT] LED ready");
+  initDisplay();
+  Serial.println("[BOOT] TFT ready");
   pinMode(TFT_BL, OUTPUT);
-#ifdef TFT_BACKLIGHT_ON
-  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
-#else
-  digitalWrite(TFT_BL, HIGH);
-#endif
-#endif
+  gLastInteractionMs = millis();
+  setBacklight(true);
 
   analogReadResolution(12);
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  Serial.println("[BOOT] ADC ready");
 
   qInput     = xQueueCreate(16, sizeof(InputEvent));
   qDisplay   = xQueueCreate(1,  sizeof(DisplayData));
@@ -1705,6 +1802,7 @@ void setup(){
   qCalib     = xQueueCreate(4,  sizeof(CalibMsg));
   mRS485     = xSemaphoreCreateMutex();
   egFlags    = xEventGroupCreate();
+  Serial.println("[BOOT] RTOS objects ready");
 
   gInputArgs.qInput = qInput;
 
@@ -1718,16 +1816,16 @@ void setup(){
   gSensorArgs.rs485      = mRS485;
   gSensorArgs.flags      = egFlags;
   gSensorArgs.status     = &gStatus;
-  gSensorArgs.ds         = &dsAsync;
 
   gHTTPArgs.qTelemetry = qTelemetry;
   gHTTPArgs.flags      = egFlags;
   gHTTPArgs.status     = &gStatus;
 
-  xTaskCreatePinnedToCore(TaskInput,   "TaskInput",   4096, &gInputArgs,   5, NULL, 1);
-  xTaskCreatePinnedToCore(TaskUI,      "TaskUI",      6144, &gUIArgs,      4, NULL, 1);
-  xTaskCreatePinnedToCore(TaskSensors, "TaskSensors", 6144, &gSensorArgs,  1, NULL, 0);
-  xTaskCreatePinnedToCore(TaskHTTP,    "TaskHTTP",    6144, &gHTTPArgs,    1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskInput,   "TaskInput",   4096,  &gInputArgs,   5, NULL, 1);
+  xTaskCreatePinnedToCore(TaskUI,      "TaskUI",      10240, &gUIArgs,      4, NULL, 1);
+  xTaskCreatePinnedToCore(TaskSensors, "TaskSensors", 8192,  &gSensorArgs,  1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskHTTP,    "TaskHTTP",    8192,  &gHTTPArgs,    1, NULL, 0);
+  Serial.println("[BOOT] tasks started");
 }
 
 void loop(){
