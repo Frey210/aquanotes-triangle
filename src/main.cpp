@@ -68,10 +68,10 @@ static const uint32_t TFT_SPI_FREQ = 16000000;
 #define RS485_DE_RE_PIN 14
 
 // Slave IDs modular
-#define PH_SLAVE_ID   12   // pH
-#define EC_SLAVE_ID   30   // EC/TDS/Sal
+#define PH_SLAVE_ID   3   // pH
+#define EC_SLAVE_ID   4   // EC/TDS/Sal
 #define NH4_SLAVE_ID  1   // NH4
-#define DO_SLAVE_ID   55  // DO (default)
+#define DO_SLAVE_ID   10  // DO (default)
 
 // Serial format
 #define PH_BAUD   9600
@@ -81,7 +81,7 @@ static const uint32_t TFT_SPI_FREQ = 16000000;
 
 // Server & Identitas
 const char* POST_URL   = "https://aeraseaku.inkubasistartupunhas.id/sensor/";
-const char* UID        = "AER2023AQ0019";
+const char* UID        = "AER2023AQ0021";
 const char* FW_VERSION = "v1.3.0-RTOS-BTN4";
 const uint32_t POST_INTERVAL_MS = 10000; // 10 detik
 const uint32_t HTTP_TIMEOUT_MS  = 3500;
