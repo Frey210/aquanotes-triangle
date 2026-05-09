@@ -354,6 +354,7 @@ bool postData(const DisplayData& s, RuntimeStatus& status) {
   http.setTimeout(HTTP_TIMEOUT_MS);
 
   String ts = makeTimestamp();
+  const float salinityPpt = isfinite(s.sal) ? (s.sal / 1000.0f) : NAN;
 
   String payload = "{";
   payload += "\"uid\":\""      + String(UID)           + "\",";
@@ -362,7 +363,7 @@ bool postData(const DisplayData& s, RuntimeStatus& status) {
   payload += "\"do\":"         + String(s.do_mgL, 2)   + ",";
   payload += "\"tds\":"        + String(s.tds,    2)   + ",";
   payload += "\"ammonia\":"    + String(s.nh4,    3)   + ",";
-  payload += "\"salinitas\":"  + String(s.sal,    2)   + ",";
+  payload += "\"salinitas\":"  + String(salinityPpt, 3) + ",";
   if (s.bat_ok){
     payload += "\"battery_v\":"   + String(s.bat_v,   2) + ",";
     payload += "\"battery_pct\":" + String(s.bat_pct, 1) + ",";
@@ -750,13 +751,18 @@ struct DashboardCache {
   char temp[16];
   char do_mg[16];
   char ph[16];
-  char nh4[16];
+  char sal[16];
   char ec[16];
   char tds[16];
   char statusLeft[48];
   char statusRight[24];
   bool valid = false;
 };
+
+static float salinityToPpt(float salinityPpm){
+  if (!isfinite(salinityPpm)) return NAN;
+  return salinityPpm / 1000.0f;
+}
 
 static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
   if (isfinite(d.t_ds)) snprintf(out.temp, sizeof(out.temp), "%.2f", d.t_ds);
@@ -765,8 +771,8 @@ static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
   else          snprintf(out.do_mg, sizeof(out.do_mg), "--");
   if (d.ph_ok)  snprintf(out.ph, sizeof(out.ph), "%.2f", d.ph);
   else          snprintf(out.ph, sizeof(out.ph), "--");
-  if (d.nh4_ok) snprintf(out.nh4, sizeof(out.nh4), "%.2f", d.nh4);
-  else          snprintf(out.nh4, sizeof(out.nh4), "--");
+  if (d.ec_ok)  snprintf(out.sal, sizeof(out.sal), "%.3f", salinityToPpt(d.sal));
+  else          snprintf(out.sal, sizeof(out.sal), "--");
   if (d.ec_ok)  snprintf(out.ec, sizeof(out.ec), "%.0f", d.ec);
   else          snprintf(out.ec, sizeof(out.ec), "--");
   if (d.ec_ok)  snprintf(out.tds, sizeof(out.tds), "%.0f", d.tds);
@@ -909,9 +915,9 @@ static void drawDashboardFrame(const DisplayData& d){
   else         snprintf(buf, sizeof(buf), "--");
   drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", buf, TFT_GREEN);
 
-  if (d.nh4_ok) snprintf(buf, sizeof(buf), "%.2f", d.nh4);
+  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.3f", salinityToPpt(d.sal));
   else          snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "NH4", buf, TFT_ORANGE);
+  drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "Salinity", buf, TFT_ORANGE);
 
   if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f", d.ec);
   else         snprintf(buf, sizeof(buf), "--");
@@ -947,8 +953,8 @@ static void drawDashboardUpdate(const DisplayData& d, DashboardCache& cache, boo
   if (force || !cache.valid || strncmp(cache.ph, now.ph, sizeof(now.ph)) != 0){
     drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", now.ph, TFT_GREEN);
   }
-  if (force || !cache.valid || strncmp(cache.nh4, now.nh4, sizeof(now.nh4)) != 0){
-    drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "NH4", now.nh4, TFT_ORANGE);
+  if (force || !cache.valid || strncmp(cache.sal, now.sal, sizeof(now.sal)) != 0){
+    drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "Salinity", now.sal, TFT_ORANGE);
   }
   if (force || !cache.valid || strncmp(cache.ec, now.ec, sizeof(now.ec)) != 0){
     drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", now.ec, TFT_BLUE);

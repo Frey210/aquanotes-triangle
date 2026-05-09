@@ -80,6 +80,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 ## Telemetry HTTP
 - Endpoint: `https://aeraseaku.inkubasistartupunhas.id/sensor/`
 - Payload: JSON berisi UID, suhu, pH, DO, TDS, NH4, salinitas, timestamp.
+- Nilai `salinitas` yang dikirim ke server memakai satuan `ppt`.
 - Interval: 10 s (konfigurasi `POST_INTERVAL_MS`).
 
 ## Modbus Ringkas
@@ -92,6 +93,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 - Slave ID firmware: `30`
 - Read realtime: `0x03`, start `0x0000`, count `10`
 - Format data: `[EC][internal][temperature][TDS][salinity]` sebagai `float32 big-endian`
+- Dashboard menampilkan kartu `Salinity` dalam `ppt` menggunakan nilai salinitas sensor EC yang dikonversi dari `ppm`.
 
 ### NH4
 - Slave ID firmware: `1`
