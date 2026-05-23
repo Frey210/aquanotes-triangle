@@ -81,7 +81,7 @@ static const uint32_t TFT_SPI_FREQ = 16000000;
 
 // Server & Identitas
 const char* POST_URL   = "https://aeraseaku.inkubasistartupunhas.id/sensor/";
-const char* UID        = "AER2023AQ0021";
+const char* UID        = "AER2023AQ0024";
 const char* FW_VERSION = "v1.3.0-RTOS-BTN4";
 const uint32_t POST_INTERVAL_MS = 10000; // 10 detik
 const uint32_t HTTP_TIMEOUT_MS  = 3500;
@@ -237,10 +237,56 @@ volatile bool gBacklightOn = true;
 
 // Battery sensor (SEN-0052)
 #define BAT_ADC_PIN 1
-static const float BAT_V_FULL   = 16.8f;
-static const float BAT_V_EMPTY  = 12.0f;
-static const float BAT_DIV_RATIO = 5.0f; // SEN-0052 typical 1/5 divider
+static const float BAT_DIV_R1   = 100000.0f; // ohm, top resistor to battery+
+static const float BAT_DIV_R2   = 22000.0f;  // ohm, bottom resistor to GND
+static const float BAT_DIV_RATIO = (BAT_DIV_R1 + BAT_DIV_R2) / BAT_DIV_R2;
+static const float BAT_CAL_FACTOR = 1.0338f;
 static const uint8_t BAT_SAMPLES = 8;
+static const float BAT_FILTER_ALPHA = 0.15f;
+static const float BAT_PCT_DEADBAND = 0.5f;
+
+struct BatterySocPoint {
+  float volts;
+  float pct;
+};
+
+// Kurva aproksimasi 4S Li-ion (tegangan pack) untuk kondisi idle / beban ringan.
+static const BatterySocPoint BAT_4S_SOC_TABLE[] = {
+  {16.80f, 100.0f},
+  {16.40f,  95.0f},
+  {16.20f,  90.0f},
+  {16.00f,  80.0f},
+  {15.80f,  70.0f},
+  {15.60f,  60.0f},
+  {15.40f,  50.0f},
+  {15.20f,  40.0f},
+  {15.00f,  30.0f},
+  {14.80f,  20.0f},
+  {14.40f,  10.0f},
+  {14.00f,   5.0f},
+  {13.20f,   0.0f}
+};
+
+static float batteryVoltageToPercent4S(float vbat){
+  if (!isfinite(vbat)) return 0.0f;
+
+  const size_t n = sizeof(BAT_4S_SOC_TABLE) / sizeof(BAT_4S_SOC_TABLE[0]);
+  if (vbat >= BAT_4S_SOC_TABLE[0].volts) return 100.0f;
+  if (vbat <= BAT_4S_SOC_TABLE[n - 1].volts) return 0.0f;
+
+  for (size_t i = 0; i < n - 1; ++i){
+    const BatterySocPoint& hi = BAT_4S_SOC_TABLE[i];
+    const BatterySocPoint& lo = BAT_4S_SOC_TABLE[i + 1];
+    if (vbat <= hi.volts && vbat >= lo.volts){
+      const float spanV = hi.volts - lo.volts;
+      if (spanV <= 0.0001f) return lo.pct;
+      const float t = (vbat - lo.volts) / spanV;
+      return lo.pct + t * (hi.pct - lo.pct);
+    }
+  }
+
+  return 0.0f;
+}
 
 TaskInputArgs   gInputArgs{};
 TaskUIArgs      gUIArgs{};
@@ -399,18 +445,47 @@ bool postData(const DisplayData& s, RuntimeStatus& status) {
 //  PEMBACAAN SENSOR
 // =======================
 static bool readBattery(float& vbat, float& pct){
+  static bool batFilterInit = false;
+  static float vbatFiltered = 0.0f;
+  static float pctFiltered = 0.0f;
+
   uint32_t acc = 0;
   for (uint8_t i = 0; i < BAT_SAMPLES; ++i){
     acc += analogReadMilliVolts(BAT_ADC_PIN);
   }
   float v_adc = (acc / static_cast<float>(BAT_SAMPLES)) / 1000.0f;
-  vbat = v_adc * BAT_DIV_RATIO;
-  if (vbat < 0.1f || isnan(vbat)){
+  float vbatRaw = v_adc * BAT_DIV_RATIO * BAT_CAL_FACTOR;
+  if (vbatRaw < 0.1f || isnan(vbatRaw)){
     pct = 0.0f;
     return false;
   }
-  pct = (vbat - BAT_V_EMPTY) * 100.0f / (BAT_V_FULL - BAT_V_EMPTY);
-  pct = constrain(pct, 0.0f, 100.0f);
+
+  if (!batFilterInit){
+    vbatFiltered = vbatRaw;
+    pctFiltered = batteryVoltageToPercent4S(vbatRaw);
+    batFilterInit = true;
+  } else {
+    vbatFiltered += BAT_FILTER_ALPHA * (vbatRaw - vbatFiltered);
+
+    const float pctNow = batteryVoltageToPercent4S(vbatFiltered);
+    if (fabsf(pctNow - pctFiltered) >= BAT_PCT_DEADBAND){
+      pctFiltered = pctNow;
+    }
+  }
+
+  vbat = vbatFiltered;
+  pct = pctFiltered;
+
+#if DEBUG_MODBUS
+  Serial.print("[BAT] v_adc=");
+  Serial.print(v_adc, 3);
+  Serial.print(" V, raw=");
+  Serial.print(vbatRaw, 2);
+  Serial.print(" V, filt=");
+  Serial.print(vbat, 2);
+  Serial.print(", pct=");
+  Serial.println(pct, 1);
+#endif
   return true;
 }
 
