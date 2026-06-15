@@ -8,9 +8,9 @@ enum class UIState : uint8_t{
   WIFI_MGR,
   CALIB,
   CAL_EC,
-  CAL_NH4,
   CAL_DO,
-  CAL_PH
+  CAL_PH,
+  CAL_WIZARD
 };
 
 // Snapshot data yang dikirim dari TaskSensors ke TaskUI/TaskHTTP

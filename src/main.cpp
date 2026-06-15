@@ -67,8 +67,14 @@ static const uint32_t TFT_SPI_FREQ = 16000000;
 #define RS485_TX_PIN    15
 #define RS485_DE_RE_PIN 14
 
-// Slave IDs modular
-#define PH_SLAVE_ID   3   // pH
+// Slave IDs modular (old sensor)
+// #define PH_SLAVE_ID   12   // pH
+// #define EC_SLAVE_ID   30   // EC/TDS/Sal
+// #define NH4_SLAVE_ID  1   // NH4
+// #define DO_SLAVE_ID   55  // DO (default)
+
+// Slave IDs modular (new sensor)
+#define PH_SLAVE_ID   12   // pH
 #define EC_SLAVE_ID   4   // EC/TDS/Sal
 #define NH4_SLAVE_ID  1   // NH4
 #define DO_SLAVE_ID   10  // DO (default)
@@ -81,7 +87,7 @@ static const uint32_t TFT_SPI_FREQ = 16000000;
 
 // Server & Identitas
 const char* POST_URL   = "https://aeraseaku.inkubasistartupunhas.id/sensor/";
-const char* UID        = "AER2023AQ0024";
+const char* UID        = "AER2023AQ0028";
 const char* FW_VERSION = "v1.3.0-RTOS-BTN4";
 const uint32_t POST_INTERVAL_MS = 10000; // 10 detik
 const uint32_t HTTP_TIMEOUT_MS  = 3500;
@@ -159,6 +165,7 @@ struct TaskUIArgs {
   QueueHandle_t qInput;
   QueueHandle_t qDisplay;
   QueueHandle_t qCalib;
+  QueueHandle_t qCalibResult;
   EventGroupHandle_t flags;
 };
 
@@ -166,6 +173,7 @@ struct TaskSensorArgs {
   QueueHandle_t qDisplay;
   QueueHandle_t qTelemetry;
   QueueHandle_t qCalib;
+  QueueHandle_t qCalibResult;
   SemaphoreHandle_t rs485;
   EventGroupHandle_t flags;
   RuntimeStatus* status;
@@ -189,6 +197,7 @@ QueueHandle_t qInput;      // Input events -> UI
 QueueHandle_t qDisplay;    // Snapshot sensor -> UI (len=1, overwrite)
 QueueHandle_t qTelemetry;  // Snapshot sensor -> HTTP (len=1, overwrite)
 QueueHandle_t qCalib;      // Perintah kalibrasi -> TaskSensors
+QueueHandle_t qCalibResult;// Hasil kalibrasi -> TaskUI
 SemaphoreHandle_t mRS485;  // Mutex RS485
 EventGroupHandle_t egFlags;
 
@@ -209,24 +218,23 @@ struct InputEvent {
 enum class CalibCmd: uint8_t {
   NONE,
   EC_1413, EC_12880,
-  NH4_SET_1, NH4_SET_10, NH4_ZERO, NH4_SLOPE, NH4_SET_TEMP25,
-  DO_TEMP_FROM_DS, DO_ZERO, DO_SLOPE,
-  PH_401, PH_700, PH_1001, PH_TC_EXT, PH_TC_OFF, PH_TC_ONB
+  DO_ZERO, DO_AIR,
+  PH_400, PH_700, PH_1000
 };
 struct CalibMsg {
   CalibCmd cmd;
 };
 
+struct CalibResult {
+  CalibCmd cmd;
+  bool ok;
+};
+
 // Register map (from vendor datasheets)
-static const uint16_t REG_EC_CAL_1413   = 0x0030; // write 0xFFFF to auto-cal at 1413 uS/cm
-static const uint16_t REG_EC_CAL_12880  = 0x0031; // write 0xFFFF to auto-cal at 12880 uS/cm
-static const uint16_t REG_PH_CAL_401    = 0x0030; // write 0xFFFF to auto-cal pH 4.01
-static const uint16_t REG_PH_CAL_700    = 0x0031; // write 0xFFFF to auto-cal pH 7.00
-static const uint16_t REG_PH_CAL_1001   = 0x0032; // write 0xFFFF to auto-cal pH 10.01
-static const uint16_t REG_PH_TC_MODE    = 0x0020; // 0 external, 1 disabled, 2 onboard
-static const uint16_t REG_DO_TEMP_CAL   = 0x1000; // value = temp*10
+static const uint16_t REG_EC_CAL_FLOAT  = 0x0050;
+static const uint16_t REG_PH_CAL_FIXED  = 0x0055;
 static const uint16_t REG_DO_ZERO       = 0x1001; // write 0
-static const uint16_t REG_DO_SLOPE      = 0x1003; // write 0
+static const uint16_t REG_DO_AIR        = 0x1003; // air/slope calibration
 
 // =======================
 //  GLOBAL STATUS
@@ -294,7 +302,7 @@ TaskSensorArgs  gSensorArgs{};
 TaskHTTPArgs    gHTTPArgs{};
 
 // Menu cursors
-int menuCursor=0, calCursor=0, ecCalCursor=0, nh4CalCursor=0, doCalCursor=0, phCalCursor=0;
+int menuCursor=0, calCursor=0, ecCalCursor=0, doCalCursor=0, phCalCursor=0;
 
 // Toast (non-blocking)
 static uint32_t toastUntil = 0;
@@ -545,7 +553,7 @@ bool readEC(float& t, float& ec, float& tds, float& sal){
 
 #if DEBUG_MODBUS
     Serial.print("[EC] EC=");        Serial.print(ec);
-    Serial.print(" uS/cm, T=");      Serial.print(t);
+    Serial.print(" mS/cm, T=");      Serial.print(t);
     Serial.print(" C, TDS=");        Serial.print(tds);
     Serial.print(" mg/L, Sal=");     Serial.println(sal);
 #endif
@@ -697,53 +705,43 @@ static bool writeReg(ModbusMaster& mb, uint16_t reg, uint16_t value){
   return res == mb.ku8MBSuccess;
 }
 
-static void handleCalibration(CalibCmd cmd, DisplayData& cur){
+static bool writeFloatRegisters(ModbusMaster& mb, uint16_t reg, float value){
+  uint32_t raw = 0;
+  memcpy(&raw, &value, sizeof(raw));
+  mb.clearTransmitBuffer();
+  mb.setTransmitBuffer(0, static_cast<uint16_t>(raw >> 16));
+  mb.setTransmitBuffer(1, static_cast<uint16_t>(raw & 0xFFFF));
+  return mb.writeMultipleRegisters(reg, 2) == mb.ku8MBSuccess;
+}
+
+static bool handleCalibration(CalibCmd cmd){
   bool ok = false;
   switch (cmd){
     case CalibCmd::EC_1413:
-      ok = writeReg(mb_ec, REG_EC_CAL_1413, 0xFFFF);
+      ok = writeFloatRegisters(mb_ec, REG_EC_CAL_FLOAT, 1.413f);
       break;
     case CalibCmd::EC_12880:
-      ok = writeReg(mb_ec, REG_EC_CAL_12880, 0xFFFF);
-      break;
-    case CalibCmd::DO_TEMP_FROM_DS:
-      if (!isnan(cur.t_ds)){
-        ok = writeReg(mb_do, REG_DO_TEMP_CAL, static_cast<uint16_t>(cur.t_ds * 10.0f));
-      }
+      ok = writeFloatRegisters(mb_ec, REG_EC_CAL_FLOAT, 12.88f);
       break;
     case CalibCmd::DO_ZERO:
       ok = writeReg(mb_do, REG_DO_ZERO, 0);
       break;
-    case CalibCmd::DO_SLOPE:
-      ok = writeReg(mb_do, REG_DO_SLOPE, 0);
+    case CalibCmd::DO_AIR:
+      ok = writeReg(mb_do, REG_DO_AIR, 0);
       break;
-    case CalibCmd::PH_401:
-      ok = writeReg(mb_ph, REG_PH_CAL_401, 0xFFFF);
+    case CalibCmd::PH_400:
+      ok = writeReg(mb_ph, REG_PH_CAL_FIXED, 4);
       break;
     case CalibCmd::PH_700:
-      ok = writeReg(mb_ph, REG_PH_CAL_700, 0xFFFF);
+      ok = writeReg(mb_ph, REG_PH_CAL_FIXED, 7);
       break;
-    case CalibCmd::PH_1001:
-      ok = writeReg(mb_ph, REG_PH_CAL_1001, 0xFFFF);
-      break;
-    case CalibCmd::PH_TC_EXT:
-      ok = writeReg(mb_ph, REG_PH_TC_MODE, 0); // external probe
-      break;
-    case CalibCmd::PH_TC_OFF:
-      ok = writeReg(mb_ph, REG_PH_TC_MODE, 1); // disabled
-      break;
-    case CalibCmd::PH_TC_ONB:
-      ok = writeReg(mb_ph, REG_PH_TC_MODE, 2); // onboard
+    case CalibCmd::PH_1000:
+      ok = writeReg(mb_ph, REG_PH_CAL_FIXED, 10);
       break;
     default:
       break;
   }
-
-  if (ok) {
-    showToast("Cal OK");
-  } else if (cmd != CalibCmd::NONE){
-    showToast("Cal Fail");
-  }
+  return ok;
 }
 
 // =======================
@@ -772,49 +770,63 @@ const char* MAIN_ITEMS[] = {
 const int MAIN_COUNT = sizeof(MAIN_ITEMS)/sizeof(MAIN_ITEMS[0]);
 
 const char* CAL_ITEMS[] = {
-  "Cal EC (Auto)",
-  "Cal NH4",
-  "Cal DO",
-  "Cal pH (S-PH-01)",
-  "Back"
+  "Kalibrasi pH",
+  "Kalibrasi EC",
+  "Kalibrasi DO",
+  "Kembali"
 };
 const int CAL_COUNT = sizeof(CAL_ITEMS)/sizeof(CAL_ITEMS[0]);
 
 const char* EC_CAL_ITEMS[] = {
-  "EC 1413",
-  "EC 12880",
-  "Back"
+  "Larutan 1.413 mS/cm",
+  "Larutan 12.88 mS/cm",
+  "Kembali"
 };
 const int EC_CAL_COUNT = sizeof(EC_CAL_ITEMS)/sizeof(EC_CAL_ITEMS[0]);
 
-const char* NH4_CAL_ITEMS[] = {
-  "Set 1 mg/L",
-  "Set 10 mg/L",
-  "Zero",
-  "Slope",
-  "Set Temp=25C",
-  "Back"
-};
-const int NH4_CAL_COUNT = sizeof(NH4_CAL_ITEMS)/sizeof(NH4_CAL_ITEMS[0]);
-
 const char* DO_CAL_ITEMS[] = {
-  "Temp from Sensor",
-  "Zero",
-  "Slope",
-  "Back"
+  "Nol Oksigen (Na2SO3)",
+  "Udara (100% saturasi)",
+  "Kembali"
 };
 const int DO_CAL_COUNT = sizeof(DO_CAL_ITEMS)/sizeof(DO_CAL_ITEMS[0]);
 
 const char* PH_CAL_ITEMS[] = {
-  "pH 4.01",
-  "pH 7.00",
-  "pH 10.01",
-  "TC External",
-  "TC Off",
-  "TC On Board",
-  "Back"
+  "Buffer pH 7.00 (awal)",
+  "Buffer pH 4.00",
+  "Buffer pH 10.00",
+  "Kembali"
 };
 const int PH_CAL_COUNT = sizeof(PH_CAL_ITEMS)/sizeof(PH_CAL_ITEMS[0]);
+
+enum class CalSensor: uint8_t { PH, EC, DO };
+enum class CalWizardStage: uint8_t { PREPARE, WAIT_STABLE, SENDING, RESULT };
+
+struct CalibrationOption {
+  CalibCmd cmd;
+  CalSensor sensor;
+  const char* title;
+  const char* instruction1;
+  const char* instruction2;
+  const char* instruction3;
+  uint16_t waitSeconds;
+};
+
+static const CalibrationOption CAL_PH_OPTIONS[] = {
+  {CalibCmd::PH_700,  CalSensor::PH, "pH 7.00",  "Bilas probe dengan air DI", "Celupkan ke buffer pH 7.00",  "Gunakan 30-50 mL larutan", 60},
+  {CalibCmd::PH_400,  CalSensor::PH, "pH 4.00",  "Bilas probe dengan air DI", "Celupkan ke buffer pH 4.00",  "Lakukan setelah kalibrasi pH 7", 60},
+  {CalibCmd::PH_1000, CalSensor::PH, "pH 10.00", "Bilas probe dengan air DI", "Celupkan ke buffer pH 10.00", "Langkah ini bersifat opsional", 60}
+};
+
+static const CalibrationOption CAL_EC_OPTIONS[] = {
+  {CalibCmd::EC_1413,  CalSensor::EC, "EC 1.413 mS/cm", "Bilas probe dengan air DI", "Celup ke larutan 1.413 mS/cm", "Gunakan 30-50 mL larutan", 120},
+  {CalibCmd::EC_12880, CalSensor::EC, "EC 12.88 mS/cm", "Bilas probe dengan air DI", "Celup ke larutan 12.88 mS/cm", "Gunakan 30-50 mL larutan", 120}
+};
+
+static const CalibrationOption CAL_DO_OPTIONS[] = {
+  {CalibCmd::DO_ZERO, CalSensor::DO, "DO Nol Oksigen", "Larutkan 5g Na2SO3/100mL", "Celupkan probe ke larutan", "Pastikan probe terendam", 180},
+  {CalibCmd::DO_AIR,  CalSensor::DO, "DO Udara 100%", "Bilas dan keringkan probe", "Letakkan probe di udara bebas", "Jangan sentuh membran probe", 180}
+};
 
 const char* WIFI_MGR_ITEMS[] = { "Start Portal", "Back" };
 const int WIFI_MGR_COUNT = sizeof(WIFI_MGR_ITEMS)/sizeof(WIFI_MGR_ITEMS[0]);
@@ -848,7 +860,7 @@ static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
   else          snprintf(out.ph, sizeof(out.ph), "--");
   if (d.ec_ok)  snprintf(out.sal, sizeof(out.sal), "%.3f", salinityToPpt(d.sal));
   else          snprintf(out.sal, sizeof(out.sal), "--");
-  if (d.ec_ok)  snprintf(out.ec, sizeof(out.ec), "%.0f", d.ec);
+  if (d.ec_ok)  snprintf(out.ec, sizeof(out.ec), "%.2f", d.ec);
   else          snprintf(out.ec, sizeof(out.ec), "--");
   if (d.ec_ok)  snprintf(out.tds, sizeof(out.tds), "%.0f", d.tds);
   else          snprintf(out.tds, sizeof(out.tds), "--");
@@ -896,12 +908,19 @@ static void drawStatusBar(const DisplayData& d){
   tft.drawString(tmp.statusRight, 316 - w, 4);
 }
 
-static void drawMetricBox(int x, int y, int w, int h, const char* label, const char* value, uint16_t color){
+static void drawMetricBox(int x, int y, int w, int h, const char* label, const char* unit,
+                          const char* value, uint16_t color){
   tft.fillRect(x, y, w, h, TFT_BLACK);
   tft.drawRect(x, y, w, h, TFT_DARKGREY);
   tft.setTextFont(2);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   tft.drawString(label, x + 6, y + 4);
+
+  if (unit && unit[0]){
+    tft.setTextFont(1);
+    const int16_t unitW = tft.textWidth(unit, 1);
+    tft.drawString(unit, x + w - unitW - 6, y + 8);
+  }
 
   uint8_t valueFont = 4;
   const int maxTextW = w - 12;
@@ -980,27 +999,27 @@ static void drawDashboardFrame(const DisplayData& d){
 
   if (isfinite(d.t_ds)) snprintf(buf, sizeof(buf), "%.2f", d.t_ds);
   else                  snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap, y0, colW, rowH, "Temperature", buf, TFT_YELLOW);
+  drawMetricBox(gap, y0, colW, rowH, "Temp", "C", buf, TFT_YELLOW);
 
   if (d.do_ok) snprintf(buf, sizeof(buf), "%.2f", d.do_mgL);
   else         snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap * 2 + colW, y0, colW, rowH, "Dissolved O2", buf, TFT_CYAN);
+  drawMetricBox(gap * 2 + colW, y0, colW, rowH, "DO", "mg/L", buf, TFT_CYAN);
 
   if (d.ph_ok) snprintf(buf, sizeof(buf), "%.2f", d.ph);
   else         snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", buf, TFT_GREEN);
+  drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", "", buf, TFT_GREEN);
 
   if (d.ec_ok) snprintf(buf, sizeof(buf), "%.3f", salinityToPpt(d.sal));
   else          snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "Salinity", buf, TFT_ORANGE);
+  drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "Salinity", "ppt", buf, TFT_ORANGE);
 
-  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f", d.ec);
+  if (d.ec_ok) snprintf(buf, sizeof(buf), "%.2f", d.ec);
   else         snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", buf, TFT_BLUE);
+  drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", "mS/cm", buf, TFT_BLUE);
 
   if (d.ec_ok) snprintf(buf, sizeof(buf), "%.0f", d.tds);
   else         snprintf(buf, sizeof(buf), "--");
-  drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", buf, TFT_MAGENTA);
+  drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", "mg/L", buf, TFT_MAGENTA);
 
   drawToastOverlay();
 }
@@ -1020,22 +1039,22 @@ static void drawDashboardUpdate(const DisplayData& d, DashboardCache& cache, boo
   const int y0 = 28;
 
   if (force || !cache.valid || strncmp(cache.temp, now.temp, sizeof(now.temp)) != 0){
-    drawMetricBox(gap, y0, colW, rowH, "Temperature", now.temp, TFT_YELLOW);
+    drawMetricBox(gap, y0, colW, rowH, "Temp", "C", now.temp, TFT_YELLOW);
   }
   if (force || !cache.valid || strncmp(cache.do_mg, now.do_mg, sizeof(now.do_mg)) != 0){
-    drawMetricBox(gap * 2 + colW, y0, colW, rowH, "Dissolved O2", now.do_mg, TFT_CYAN);
+    drawMetricBox(gap * 2 + colW, y0, colW, rowH, "DO", "mg/L", now.do_mg, TFT_CYAN);
   }
   if (force || !cache.valid || strncmp(cache.ph, now.ph, sizeof(now.ph)) != 0){
-    drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", now.ph, TFT_GREEN);
+    drawMetricBox(gap, y0 + rowH + gap, colW, rowH, "pH", "", now.ph, TFT_GREEN);
   }
   if (force || !cache.valid || strncmp(cache.sal, now.sal, sizeof(now.sal)) != 0){
-    drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "Salinity", now.sal, TFT_ORANGE);
+    drawMetricBox(gap * 2 + colW, y0 + rowH + gap, colW, rowH, "Salinity", "ppt", now.sal, TFT_ORANGE);
   }
   if (force || !cache.valid || strncmp(cache.ec, now.ec, sizeof(now.ec)) != 0){
-    drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", now.ec, TFT_BLUE);
+    drawMetricBox(gap, y0 + (rowH + gap) * 2, colW, rowH, "EC", "mS/cm", now.ec, TFT_BLUE);
   }
   if (force || !cache.valid || strncmp(cache.tds, now.tds, sizeof(now.tds)) != 0){
-    drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", now.tds, TFT_MAGENTA);
+    drawMetricBox(gap * 2 + colW, y0 + (rowH + gap) * 2, colW, rowH, "TDS", "mg/L", now.tds, TFT_MAGENTA);
   }
 
   cache = now;
@@ -1074,6 +1093,109 @@ static void drawMenuItem(const char* items[], int index, bool selected){
   tft.setTextColor(TFT_WHITE, selected ? TFT_BLUE : TFT_BLACK);
   tft.setTextFont(2);
   tft.drawString(items[index], 12, y);
+}
+
+static bool calibrationLiveValue(const CalibrationOption& option, const DisplayData& d,
+                                 float& value, const char*& unit){
+  switch (option.sensor){
+    case CalSensor::PH:
+      value = d.ph;
+      unit = "pH";
+      return d.ph_ok && isfinite(value);
+    case CalSensor::EC:
+      value = d.ec;
+      unit = "mS/cm";
+      return d.ec_ok && isfinite(value);
+    case CalSensor::DO:
+      value = d.do_mgL;
+      unit = "mg/L";
+      return d.do_ok && isfinite(value);
+  }
+  return false;
+}
+
+static void drawWizardInstruction(const char* prefix, const char* text, int16_t y){
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(prefix, 8, y);
+
+  uint8_t size = tft.textWidth(text, 2) <= 282 ? 2 : 1;
+  tft.setTextFont(size);
+  tft.drawString(text, 28, y + (size == 1 ? 4 : 0));
+}
+
+static void drawCalibrationWizard(const CalibrationOption& option, CalWizardStage stage,
+                                  const DisplayData& d, uint32_t elapsedSeconds, bool resultOK){
+  tft.fillScreen(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 28, TFT_NAVY);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.drawString(option.title, 8, 6);
+
+  if (stage == CalWizardStage::PREPARE){
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Langkah 1/3 - Persiapan", 8, 38);
+    drawWizardInstruction("1.", option.instruction1, 72);
+    drawWizardInstruction("2.", option.instruction2, 102);
+    drawWizardInstruction("3.", option.instruction3, 132);
+    tft.fillRect(0, 205, 320, 35, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawString("OK: mulai   BACK: batal", 24, 216);
+    return;
+  }
+
+  if (stage == CalWizardStage::WAIT_STABLE){
+    float value = NAN;
+    const char* unit = "";
+    const bool valid = calibrationLiveValue(option, d, value, unit);
+    const uint32_t wait = option.waitSeconds;
+    const uint32_t remaining = elapsedSeconds >= wait ? 0 : wait - elapsedSeconds;
+    const uint32_t progressSeconds = elapsedSeconds < wait ? elapsedSeconds : wait;
+    const uint16_t progress = static_cast<uint16_t>(progressSeconds * 280UL / wait);
+
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Langkah 2/3 - Tunggu stabil", 8, 38);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Nilai sensor saat ini", 8, 70);
+
+    char valueText[32];
+    if (valid) snprintf(valueText, sizeof(valueText), "%.2f %s", value, unit);
+    else       snprintf(valueText, sizeof(valueText), "Sensor belum terbaca");
+    tft.setTextFont(valid ? 4 : 2);
+    tft.setTextColor(valid ? TFT_CYAN : TFT_ORANGE, TFT_BLACK);
+    tft.drawCentreString(valueText, 160, 96, valid ? 4 : 2);
+
+    tft.drawRect(20, 148, 280, 16, TFT_WHITE);
+    tft.fillRect(22, 150, progress > 4 ? progress - 4 : 0, 12, TFT_GREEN);
+    tft.setTextFont(2);
+    char waitText[40];
+    if (remaining > 0) snprintf(waitText, sizeof(waitText), "Tunggu %lu detik", static_cast<unsigned long>(remaining));
+    else               snprintf(waitText, sizeof(waitText), "Nilai siap dikalibrasi");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString(waitText, 160, 174, 2);
+
+    tft.fillRect(0, 205, 320, 35, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawCentreString(remaining == 0 && valid ? "OK: simpan  BACK: batal" : "BACK: batal", 160, 216, 2);
+    return;
+  }
+
+  if (stage == CalWizardStage::SENDING){
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawCentreString("Menyimpan kalibrasi...", 160, 85, 2);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawCentreString("Jangan cabut sensor", 160, 120, 2);
+    return;
+  }
+
+  tft.setTextColor(resultOK ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  tft.drawCentreString(resultOK ? "Kalibrasi berhasil" : "Kalibrasi gagal", 160, 72, 2);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString(resultOK ? "Bilas probe sebelum digunakan" : "Periksa sensor dan coba lagi", 160, 125, 2);
+  tft.fillRect(0, 205, 320, 35, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.drawCentreString("OK/BACK: kembali", 160, 216, 2);
 }
 
 // =======================
@@ -1188,7 +1310,8 @@ void TaskInput(void* param){
 // =======================
 void TaskUI(void* param){
   auto* args = static_cast<TaskUIArgs*>(param);
-  if (!args || !args->qInput || !args->qDisplay || !args->flags || !args->qCalib){
+  if (!args || !args->qInput || !args->qDisplay || !args->flags ||
+      !args->qCalib || !args->qCalibResult){
     vTaskDelete(NULL);
     return;
   }
@@ -1210,9 +1333,14 @@ void TaskUI(void* param){
   int lastMenuCursor = menuCursor;
   int lastCalCursor = calCursor;
   int lastEcCalCursor = ecCalCursor;
-  int lastNh4CalCursor = nh4CalCursor;
   int lastDoCalCursor = doCalCursor;
   int lastPhCalCursor = phCalCursor;
+  const CalibrationOption* activeCalibration = nullptr;
+  UIState calibrationParent = UIState::CALIB;
+  CalWizardStage wizardStage = CalWizardStage::PREPARE;
+  uint32_t wizardStartedMs = 0;
+  uint32_t lastWizardSecond = UINT32_MAX;
+  bool wizardResultOK = false;
   uint8_t modbusFailStreak = 0;
   uint8_t postErrStreak = 0;
   uint32_t ledFlashUntil = 0;
@@ -1221,6 +1349,7 @@ void TaskUI(void* param){
   for(;;){
     bool gotInput = false;
     bool gotDisplay = false;
+    bool gotCalibResult = false;
     bool forceRedraw = false;
     uint32_t idleMs = millis() - gLastInteractionMs;
     if (gBacklightOn && idleMs >= BACKLIGHT_TIMEOUT_MS){
@@ -1242,9 +1371,6 @@ void TaskUI(void* param){
           case UIState::CAL_EC:
             ecCalCursor = constrain(ecCalCursor + dir, 0, EC_CAL_COUNT-1);
             break;
-          case UIState::CAL_NH4:
-            nh4CalCursor = constrain(nh4CalCursor + dir, 0, NH4_CAL_COUNT-1);
-            break;
           case UIState::CAL_DO:
             doCalCursor = constrain(doCalCursor + dir, 0, DO_CAL_COUNT-1);
             break;
@@ -1255,13 +1381,17 @@ void TaskUI(void* param){
             break;
         }
       } else if (ev.type == BTN_PRESS){
-        if (ui==UIState::MENU || ui==UIState::WIFI_MGR || ui==UIState::CALIB ||
-            ui==UIState::CAL_EC || ui==UIState::CAL_NH4 || ui==UIState::CAL_DO || ui==UIState::CAL_PH){
-          if (ev.value==BTN_BACK){
+        if (ev.value == BTN_BACK){
+          if (ui == UIState::CAL_WIZARD){
+            if (wizardStage != CalWizardStage::SENDING) ui = calibrationParent;
+          } else if (ui == UIState::CAL_EC || ui == UIState::CAL_DO || ui == UIState::CAL_PH){
+            ui = UIState::CALIB;
+          } else if (ui == UIState::CALIB || ui == UIState::WIFI_MGR){
+            ui = UIState::MENU;
+          } else if (ui == UIState::MENU){
             ui = UIState::DASHBOARD;
-            showToast("Back");
-            continue;
           }
+          continue;
         }
 
         if (ui == UIState::DASHBOARD){
@@ -1286,58 +1416,63 @@ void TaskUI(void* param){
         } else if (ui == UIState::CALIB){
           if (ev.value == BTN_OK){
             switch (calCursor){
-              case 0: ui = UIState::CAL_EC;  break;
-              case 1: ui = UIState::CAL_NH4; break;
-              case 2: ui = UIState::CAL_DO;  break;
-              case 3: ui = UIState::CAL_PH;  break;
-              case 4: ui = UIState::DASHBOARD; break;
+              case 0: ui = UIState::CAL_PH; break;
+              case 1: ui = UIState::CAL_EC; break;
+              case 2: ui = UIState::CAL_DO; break;
+              case 3: ui = UIState::MENU;   break;
             }
-          }
-        } else if (ui == UIState::CAL_NH4){
-          if (ev.value == BTN_OK){
-            showToast("NH4 cal N/A");
-            ui = UIState::DASHBOARD;
           }
         } else if (ui == UIState::CAL_EC){
-          if (ev.value == BTN_OK && args->qCalib){
-            CalibMsg m{};
-            if (ecCalCursor == 0) { m.cmd = CalibCmd::EC_1413; }
-            else if (ecCalCursor == 1) { m.cmd = CalibCmd::EC_12880; }
-            if (m.cmd != CalibCmd::NONE){
-              xQueueSend(args->qCalib, &m, 0);
-              showToast("Cal EC");
+          if (ev.value == BTN_OK){
+            if (ecCalCursor < 2){
+              activeCalibration = &CAL_EC_OPTIONS[ecCalCursor];
+              calibrationParent = UIState::CAL_EC;
+              wizardStage = CalWizardStage::PREPARE;
+              ui = UIState::CAL_WIZARD;
+            } else {
+              ui = UIState::CALIB;
             }
-            ui = UIState::DASHBOARD;
           }
         } else if (ui == UIState::CAL_DO){
-          if (ev.value == BTN_OK && args->qCalib){
-            CalibMsg m{};
-            if (doCalCursor == 0) m.cmd = CalibCmd::DO_TEMP_FROM_DS;
-            else if (doCalCursor == 1) m.cmd = CalibCmd::DO_ZERO;
-            else if (doCalCursor == 2) m.cmd = CalibCmd::DO_SLOPE;
-            if (m.cmd != CalibCmd::NONE){
-              xQueueSend(args->qCalib, &m, 0);
-              showToast("Cal DO");
+          if (ev.value == BTN_OK){
+            if (doCalCursor < 2){
+              activeCalibration = &CAL_DO_OPTIONS[doCalCursor];
+              calibrationParent = UIState::CAL_DO;
+              wizardStage = CalWizardStage::PREPARE;
+              ui = UIState::CAL_WIZARD;
+            } else {
+              ui = UIState::CALIB;
             }
-            ui = UIState::DASHBOARD;
           }
         } else if (ui == UIState::CAL_PH){
-          if (ev.value == BTN_OK && args->qCalib){
-            CalibMsg m{};
-            switch (phCalCursor){
-              case 0: m.cmd = CalibCmd::PH_401; break;
-              case 1: m.cmd = CalibCmd::PH_700; break;
-              case 2: m.cmd = CalibCmd::PH_1001; break;
-              case 3: m.cmd = CalibCmd::PH_TC_EXT; break;
-              case 4: m.cmd = CalibCmd::PH_TC_OFF; break;
-              case 5: m.cmd = CalibCmd::PH_TC_ONB; break;
-              default: break;
+          if (ev.value == BTN_OK){
+            if (phCalCursor < 3){
+              activeCalibration = &CAL_PH_OPTIONS[phCalCursor];
+              calibrationParent = UIState::CAL_PH;
+              wizardStage = CalWizardStage::PREPARE;
+              ui = UIState::CAL_WIZARD;
+            } else {
+              ui = UIState::CALIB;
             }
-            if (m.cmd != CalibCmd::NONE){
-              xQueueSend(args->qCalib, &m, 0);
-              showToast("Cal pH");
+          }
+        } else if (ui == UIState::CAL_WIZARD && activeCalibration && ev.value == BTN_OK){
+          if (wizardStage == CalWizardStage::PREPARE){
+            wizardStage = CalWizardStage::WAIT_STABLE;
+            wizardStartedMs = millis();
+            lastWizardSecond = UINT32_MAX;
+          } else if (wizardStage == CalWizardStage::WAIT_STABLE){
+            const uint32_t elapsed = (millis() - wizardStartedMs) / 1000;
+            float liveValue = NAN;
+            const char* liveUnit = "";
+            if (elapsed >= activeCalibration->waitSeconds &&
+                calibrationLiveValue(*activeCalibration, disp, liveValue, liveUnit)){
+              CalibMsg m{activeCalibration->cmd};
+              if (xQueueSend(args->qCalib, &m, 0) == pdTRUE){
+                wizardStage = CalWizardStage::SENDING;
+              }
             }
-            ui = UIState::DASHBOARD;
+          } else if (wizardStage == CalWizardStage::RESULT){
+            ui = calibrationParent;
           }
         }
       }
@@ -1370,6 +1505,15 @@ void TaskUI(void* param){
       lastPostStatus[sizeof(lastPostStatus)-1] = '\0';
     }
 
+    CalibResult calibResult{};
+    if (xQueueReceive(args->qCalibResult, &calibResult, 0) == pdTRUE){
+      if (activeCalibration && calibResult.cmd == activeCalibration->cmd){
+        wizardResultOK = calibResult.ok;
+        wizardStage = CalWizardStage::RESULT;
+        gotCalibResult = true;
+      }
+    }
+
     EventBits_t flags = xEventGroupGetBits(args->flags);
     bool wifiOK = (flags & EG_WIFI_OK);
     bool ntpOK  = (flags & EG_TIME_OK);
@@ -1399,9 +1543,19 @@ void TaskUI(void* param){
       dashCache.valid = false;
       splashDrawn = false;
     }
-    bool needDraw = forceRedraw || gotInput || gotDisplay || toastChanged ||
+    bool wizardTick = false;
+    uint32_t wizardElapsed = 0;
+    if (ui == UIState::CAL_WIZARD && activeCalibration && wizardStage == CalWizardStage::WAIT_STABLE){
+      wizardElapsed = (now - wizardStartedMs) / 1000;
+      if (wizardElapsed != lastWizardSecond){
+        lastWizardSecond = wizardElapsed;
+        wizardTick = true;
+      }
+    }
+    const bool displayNeedsDraw = gotDisplay && ui != UIState::CAL_WIZARD;
+    bool needDraw = forceRedraw || gotInput || displayNeedsDraw || gotCalibResult || toastChanged ||
                     (wifiOK != lastWifiOK) || (ntpOK != lastNtpOK) ||
-                    (wifiBusy != lastWiFiBusy);
+                    (wifiBusy != lastWiFiBusy) || wizardTick;
 
     if (inSplash){
       if (splashPct < 100 && now - tSplash > splashPct*10){
@@ -1475,19 +1629,6 @@ void TaskUI(void* param){
               drawToastOverlay();
             }
             break;
-          case UIState::CAL_NH4:
-            if (forceRedraw){
-              drawMenu("Cal NH4", NH4_CAL_ITEMS, NH4_CAL_COUNT, nh4CalCursor);
-              lastNh4CalCursor = nh4CalCursor;
-            } else if (nh4CalCursor != lastNh4CalCursor){
-              drawMenuItem(NH4_CAL_ITEMS, lastNh4CalCursor, false);
-              drawMenuItem(NH4_CAL_ITEMS, nh4CalCursor, true);
-              lastNh4CalCursor = nh4CalCursor;
-              drawToastOverlay();
-            } else if (toastChanged) {
-              drawToastOverlay();
-            }
-            break;
           case UIState::CAL_DO:
             if (forceRedraw){
               drawMenu("Cal DO", DO_CAL_ITEMS, DO_CAL_COUNT, doCalCursor);
@@ -1512,6 +1653,12 @@ void TaskUI(void* param){
               drawToastOverlay();
             } else if (toastChanged) {
               drawToastOverlay();
+            }
+            break;
+          case UIState::CAL_WIZARD:
+            if (activeCalibration){
+              drawCalibrationWizard(*activeCalibration, wizardStage, disp,
+                                    wizardElapsed, wizardResultOK);
             }
             break;
           case UIState::WIFI_MGR:
@@ -1570,7 +1717,8 @@ void TaskUI(void* param){
 // =======================
 void TaskSensors(void* param){
   auto* args = static_cast<TaskSensorArgs*>(param);
-  if (!args || !args->qDisplay || !args->qTelemetry || !args->qCalib || !args->rs485 || !args->status || !args->flags){
+  if (!args || !args->qDisplay || !args->qTelemetry || !args->qCalib ||
+      !args->qCalibResult || !args->rs485 || !args->status || !args->flags){
     vTaskDelete(NULL);
     return;
   }
@@ -1604,13 +1752,16 @@ void TaskSensors(void* param){
     EventBits_t loopFlags = xEventGroupGetBits(args->flags);
     bool wifiBusy = (loopFlags & EG_WIFI_BUSY);
 
-    // 1) Proses perintah kalibrasi (kalau kamu masih pakai menu lama)
+    // 1) Proses perintah kalibrasi dari wizard UI.
     CalibMsg msg;
     while (xQueueReceive(args->qCalib, &msg, 0) == pdTRUE){
+      CalibResult result{msg.cmd, false};
       if (xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
-        handleCalibration(msg.cmd, cur);
+        result.ok = handleCalibration(msg.cmd);
+        rs485Receive();
         xSemaphoreGive(args->rs485);
       }
+      xQueueOverwrite(args->qCalibResult, &result);
     }
 
     // 2) Poll sensor modular satu per satu agar bus ringan dan watchdog aman
@@ -1881,6 +2032,7 @@ void setup(){
   qDisplay   = xQueueCreate(1,  sizeof(DisplayData));
   qTelemetry = xQueueCreate(1,  sizeof(DisplayData));
   qCalib     = xQueueCreate(4,  sizeof(CalibMsg));
+  qCalibResult = xQueueCreate(1, sizeof(CalibResult));
   mRS485     = xSemaphoreCreateMutex();
   egFlags    = xEventGroupCreate();
   Serial.println("[BOOT] RTOS objects ready");
@@ -1890,10 +2042,12 @@ void setup(){
   gUIArgs.qInput   = qInput;
   gUIArgs.qDisplay = qDisplay;
   gUIArgs.qCalib   = qCalib;
+  gUIArgs.qCalibResult = qCalibResult;
   gUIArgs.flags    = egFlags;
   gSensorArgs.qDisplay   = qDisplay;
   gSensorArgs.qTelemetry = qTelemetry;
   gSensorArgs.qCalib     = qCalib;
+  gSensorArgs.qCalibResult = qCalibResult;
   gSensorArgs.rs485      = mRS485;
   gSensorArgs.flags      = egFlags;
   gSensorArgs.status     = &gStatus;

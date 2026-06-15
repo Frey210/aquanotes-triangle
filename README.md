@@ -31,11 +31,11 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
   - Kalibrasi Sensor: masuk submenu kalibrasi.
 - WiFi Manager: OK untuk menyalakan portal WiFi.
 - Kalibrasi:
-  - Cal EC (Auto): pilih 1413 uS/cm atau 12880 uS/cm, OK untuk kirim perintah kalibrasi (Modbus).
-  - Cal NH4: (placeholder, belum diimplementasi pada firmware ini).
-  - Cal DO: Temp from Sensor, Zero, Slope.
-  - Cal pH (S-PH-01): pH 4.01 / 7.00 / 10.01 atau pengaturan kompensasi suhu (External/Off/Onboard).
-  - BACK di submenu manapun: kembali ke dashboard.
+  - pH: buffer pH 7.00, pH 4.00, dan pH 10.00. Untuk kalibrasi dua titik, lakukan pH 7 lalu pH 4.
+  - EC: larutan standar 1.413 mS/cm atau 12.88 mS/cm.
+  - DO: kalibrasi nol menggunakan larutan Na2SO3 atau kalibrasi udara 100% saturasi.
+  - Setiap pilihan membuka wizard persiapan, waktu tunggu, nilai sensor langsung, konfirmasi, dan hasil kalibrasi.
+  - Tombol BACK kembali satu tingkat dan membatalkan wizard selama perintah belum dikirim.
 
 ## Pinout & Wiring (ESP32-S3)
 ### TFT ILI9341 (SPI)
@@ -93,6 +93,7 @@ UI RTOS untuk ESP32-S3 dengan 4 tombol (UP/DOWN/OK/BACK) dan TFT ILI9341 320x240
 - Slave ID firmware: `30`
 - Read realtime: `0x03`, start `0x0000`, count `10`
 - Format data: `[EC][internal][temperature][TDS][salinity]` sebagai `float32 big-endian`
+- Nilai EC dari sensor ditampilkan dalam `mS/cm` dengan dua angka desimal.
 - Dashboard menampilkan kartu `Salinity` dalam `ppt` menggunakan nilai salinitas sensor EC yang dikonversi dari `ppm`.
 
 ### NH4
